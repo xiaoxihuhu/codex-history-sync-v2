@@ -33,3 +33,11 @@ class SupabaseStorage:
         )
         if response not in ({}, None) and not isinstance(response, dict):
             raise SupabaseError("Supabase Storage upload returned an invalid response")
+
+    def download(self, object_path: str, *, access_token: str) -> bytes:
+        encoded_bucket = quote(self.bucket, safe="")
+        encoded_path = quote(object_path, safe="/")
+        return self.client.download_bytes(
+            f"/storage/v1/object/{encoded_bucket}/{encoded_path}",
+            access_token=access_token,
+        )

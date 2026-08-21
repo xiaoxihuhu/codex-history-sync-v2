@@ -154,6 +154,37 @@ class SupabaseClient:
             )
         return decoded
 
+    def download_bytes(
+        self,
+        path: str,
+        *,
+        access_token: str,
+        expected_statuses: tuple[int, ...] = (200,),
+    ) -> bytes:
+        headers = {
+            "Accept": "application/octet-stream",
+            "apikey": self.config.public_key,
+            "Authorization": f"Bearer {access_token}",
+        }
+        response = self.transport.request(
+            "GET",
+            f"{self.config.project_url}{path}",
+            headers,
+            None,
+            self.timeout_seconds,
+        )
+        if response.status not in expected_statuses:
+            try:
+                decoded = decode_json(response.body)
+            except SupabaseError:
+                decoded = {}
+            raise error_from_response(
+                response.status,
+                decoded,
+                [self.config.public_key, access_token],
+            )
+        return response.body
+
 
 def decode_json(body: bytes) -> Any:
     if not body:

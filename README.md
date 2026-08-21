@@ -29,7 +29,7 @@
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
 
-V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices 客户端基础，以及 Thread / Session 手动增量上传。
+V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices、Thread / Session 手动增量上传，以及纯文本历史下载恢复。
 
 ## 运行环境
 
@@ -126,6 +126,18 @@ py -3 .\sync_backend.py --json cloud-backup
 
 当前连接的 Supabase 原型 Schema 与仓库中的 V2 migrations 不兼容。必须先在干净项目部署 `migrations/001` 至 `009`，或完成经过审查的兼容迁移，才能实际执行该命令。详见 `docs/MANUAL-CLOUD-BACKUP.md`。
 
+### 从云端恢复纯文本历史
+
+```powershell
+py -3 .\sync_backend.py --json cloud-restore
+py -3 .\sync_backend.py --json cloud-restore --thread-id THREAD_UUID
+py -3 .\sync_backend.py --json cloud-restore --target-cwd E:\Work\Recovered
+```
+
+恢复命令只下载本机缺失的 Session，先在临时目录校验大小、SHA256 和 `session_meta`，再创建本地安全备份并写入。恢复失败会还原数据库和索引，并删除本轮新建的 Session。目标机 Provider / Model 会通过 Local Repair Engine 修复。
+
+目标 `.codex` 必须先由 Codex Desktop 初始化。当前阶段只恢复纯文本 Thread / Session；图片、附件和完整 Workspace Mapping 在后续阶段实现。详见 `docs/PURE-TEXT-CLOUD-RESTORE.md`。
+
 ### 从最新备份恢复
 
 ```powershell
@@ -172,6 +184,7 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `docs/SUPABASE-SCHEMA.md`：云端 Schema、所有权和上线验证说明
 - `docs/AUTH-AND-DEVICES.md`：账号、DPAPI Session 和设备系统
 - `docs/MANUAL-CLOUD-BACKUP.md`：Thread / Session 手动上传、增量判断和验证规则
+- `docs/PURE-TEXT-CLOUD-RESTORE.md`：纯文本云端下载、目标 Schema 适配和失败回滚
 - `docs/SUPABASE-COMPATIBILITY-AUDIT.md`：现有 Supabase 原型 Schema 的只读兼容审计
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录

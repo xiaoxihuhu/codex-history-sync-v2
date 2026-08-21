@@ -58,14 +58,14 @@ def unix_timestamp_to_iso(value: object, *, milliseconds: bool = False) -> str |
     return datetime.fromtimestamp(number, tz=UTC).isoformat()
 
 
-def canonical_comparison_path(path: Path) -> Path:
+def canonical_comparison_path(path: Path, *, strict: bool = True) -> Path:
     raw_path = str(path)
     if os.name == "nt":
         if raw_path.startswith("\\\\?\\UNC\\"):
             raw_path = "\\\\" + raw_path[8:]
         elif raw_path.startswith("\\\\?\\"):
             raw_path = raw_path[4:]
-    return Path(raw_path).resolve(strict=True)
+    return Path(raw_path).resolve(strict=strict)
 
 
 def relative_session_path(codex_home: Path, rollout_path: Path) -> str:

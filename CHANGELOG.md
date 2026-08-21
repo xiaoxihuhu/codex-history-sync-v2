@@ -54,6 +54,16 @@
 - 上传后重新读取云端 Session 清单并逐项验证 Hash，验证成功后才记录设备备份时间。
 - 增加本机增量行为、路径边界、PostgREST 冲突键和 Storage 二进制请求契约测试。
 
+### Phase 7
+
+- 增加 `cloud-restore`，支持恢复全部纯文本历史或指定 Codex Thread。
+- 仅下载目标机缺失的 Session，并在临时目录验证大小、SHA256 和 `session_meta`。
+- 增加动态 Codex Thread Schema Adapter，兼容现代与简化旧版 `threads` 表。
+- 恢复时使用目标机 Provider、Model 和本地 cwd，不写入旧电脑的绝对 Session 路径。
+- 写入前创建安全备份，失败时恢复数据库和索引并删除本轮新建 Session。
+- 恢复完成后验证 SQLite、Thread、Session ID 和活动 Session 索引。
+- 增加 TestComputerA → Cloud → TestComputerB、指定 Thread、损坏对象和失败回滚测试。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。

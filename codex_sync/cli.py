@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import time
+from pathlib import Path
 
 from codex_sync import __version__
 from codex_sync.attachments import probe_attachments
@@ -13,6 +14,7 @@ from codex_sync.cloud import (
     SupabaseClient,
     SupabaseDeviceRepository,
     SupabaseManualUploadRepository,
+    SupabaseRestoreRepository,
 )
 from codex_sync.config import (
     SupabaseConfig,
@@ -30,6 +32,7 @@ from codex_sync.local.repair_engine import (
     sync_to_current_provider,
 )
 from codex_sync.sync import SyncStateStore
+from codex_sync.sync.download import ManualDownloadEngine
 from codex_sync.sync.upload import ManualUploadEngine
 
 
@@ -76,6 +79,15 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("device-register", help="Register or refresh this device in Supabase")
     subparsers.add_parser("device-list", help="List devices for the current Codex Sync account")
     subparsers.add_parser("cloud-backup", help="Upload local Thread metadata and changed Session JSONL files")
+    restore_cloud_parser = subparsers.add_parser(
+        "cloud-restore",
+        help="Restore missing plain-text Thread and Session history from Supabase",
+    )
+    restore_cloud_parser.add_argument("--thread-id", help="Restore only one Codex Thread ID")
+    restore_cloud_parser.add_argument(
+        "--target-cwd",
+        help="Local working directory assigned to restored Threads (defaults to the user home)",
+    )
     return parser
 
 
@@ -130,6 +142,7 @@ def main() -> int:
             "device-register",
             "device-list",
             "cloud-backup",
+            "cloud-restore",
         }:
             app_paths = default_app_paths()
             state = SyncStateStore(app_paths)
@@ -183,6 +196,20 @@ def main() -> int:
                     ).upload()
                     payload = {
                         "action": "cloud-backup",
+                        "summary": summary.to_dict(),
+                    }
+                elif args.command == "cloud-restore":
+                    summary = ManualDownloadEngine(
+                        paths,
+                        auth,
+                        devices,
+                        SupabaseRestoreRepository(client),
+                    ).restore(
+                        codex_thread_id=args.thread_id,
+                        target_cwd=Path(args.target_cwd) if args.target_cwd else None,
+                    )
+                    payload = {
+                        "action": "cloud-restore",
                         "summary": summary.to_dict(),
                     }
                 else:
