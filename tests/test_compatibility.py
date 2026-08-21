@@ -18,8 +18,27 @@ class CompatibilityTests(unittest.TestCase):
     def test_cli_keeps_v1_commands(self) -> None:
         parser = build_parser()
 
-        for command in ("status", "sync", "restore", "backup", "probe-attachments"):
-            args = parser.parse_args([command])
+        for command in (
+            "status",
+            "sync",
+            "restore",
+            "backup",
+            "probe-attachments",
+            "cloud-configure",
+            "auth-sign-up",
+            "auth-sign-in",
+            "auth-status",
+            "auth-sign-out",
+            "device-info",
+            "device-register",
+            "device-list",
+        ):
+            command_args = [command]
+            if command == "cloud-configure":
+                command_args += ["--url", "https://example.supabase.co"]
+            elif command in {"auth-sign-up", "auth-sign-in"}:
+                command_args += ["--email", "user@example.com"]
+            args = parser.parse_args(command_args)
             self.assertEqual(args.command, command)
 
     def test_v2_package_has_development_version(self) -> None:

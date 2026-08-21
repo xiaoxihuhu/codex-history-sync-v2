@@ -23,11 +23,13 @@
 - 你切换了登录方式
 - 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
 
-## 不适用的场景
+## V1 不适用的场景
 
 - 云端账号之间的聊天记录互相同步
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
+
+V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计以及 Auth/Devices 客户端基础。
 
 ## 运行环境
 
@@ -85,6 +87,35 @@ py -3 .\sync_backend.py --json probe-attachments
 
 该命令只读扫描 Session JSONL、归档 Session、Codex 附件清单、内嵌图片和本地图片路径，输出 Thread / Session / Message 关联、文件类型、大小、SHA256、引用位置和文件存在状态。它不会输出内嵌图片正文，也不会把普通项目路径和命令输出路径当作附件。
 
+### 配置 Codex Sync 云端账号
+
+```powershell
+py -3 .\sync_backend.py --json cloud-configure --url https://PROJECT.supabase.co
+```
+
+命令会隐藏输入客户端可公开使用的 Supabase publishable/anon key。桌面客户端会拒绝 secret/service-role key。
+
+### 注册、登录和查看账号
+
+```powershell
+py -3 .\sync_backend.py --json auth-sign-up --email user@example.com
+py -3 .\sync_backend.py --json auth-sign-in --email user@example.com
+py -3 .\sync_backend.py --json auth-status
+py -3 .\sync_backend.py --json auth-sign-out
+```
+
+密码只通过隐藏提示读取。登录 Session 使用 Windows DPAPI 加密后保存在 `%LOCALAPPDATA%\CodexHistorySync\sync_state.sqlite`。
+
+### 本机设备
+
+```powershell
+py -3 .\sync_backend.py --json device-info
+py -3 .\sync_backend.py --json device-register
+py -3 .\sync_backend.py --json device-list
+```
+
+第一次运行会生成稳定的本机 `device_id`。云端注册和列表需要先完成 Supabase V2 兼容迁移与登录。
+
 ### 从最新备份恢复
 
 ```powershell
@@ -129,6 +160,8 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `docs/ATTACHMENT-PROBE.md`：真实格式调查结果和 Probe 边界
 - `migrations/`：Supabase PostgreSQL、RLS 和 Storage 策略
 - `docs/SUPABASE-SCHEMA.md`：云端 Schema、所有权和上线验证说明
+- `docs/AUTH-AND-DEVICES.md`：账号、DPAPI Session 和设备系统
+- `docs/SUPABASE-COMPATIBILITY-AUDIT.md`：现有 Supabase 原型 Schema 的只读兼容审计
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录
 

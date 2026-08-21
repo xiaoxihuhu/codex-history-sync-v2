@@ -35,6 +35,15 @@
 - 增加私有 Storage bucket 和用户路径隔离的上传、下载、覆盖、删除策略。
 - 增加 migration 安全契约测试和 Supabase 上线验证清单。
 
+### Phase 5
+
+- 增加 Supabase 公共项目配置，并拒绝 secret/service-role key。
+- 实现独立 Codex Sync 注册、登录、登出、自动刷新、登录恢复和当前账号查询。
+- 使用 Windows DPAPI 加密 Auth Session，并保存在独立 `sync_state.sqlite`。
+- 增加稳定本机 Device ID、设备信息、云端注册和设备列表接口。
+- 密码仅通过隐藏交互输入，Token 不进入公开输出，远端错误回显会自动脱敏。
+- 只读审计现有 `codex-sync` Supabase 原型，确认需要兼容 migration，未修改主项目。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
