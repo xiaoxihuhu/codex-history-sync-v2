@@ -18,7 +18,7 @@ class CompatibilityTests(unittest.TestCase):
     def test_cli_keeps_v1_commands(self) -> None:
         parser = build_parser()
 
-        for command in ("status", "sync", "restore", "backup"):
+        for command in ("status", "sync", "restore", "backup", "probe-attachments"):
             args = parser.parse_args([command])
             self.assertEqual(args.command, command)
 

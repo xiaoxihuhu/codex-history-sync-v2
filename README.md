@@ -77,6 +77,14 @@ py -3 .\sync_backend.py --json sync --provider your-provider --model your-model
 py -3 .\sync_backend.py --json backup
 ```
 
+### 探测图片和附件
+
+```powershell
+py -3 .\sync_backend.py --json probe-attachments
+```
+
+该命令只读扫描 Session JSONL、归档 Session、Codex 附件清单、内嵌图片和本地图片路径，输出 Thread / Session / Message 关联、文件类型、大小、SHA256、引用位置和文件存在状态。它不会输出内嵌图片正文，也不会把普通项目路径和命令输出路径当作附件。
+
 ### 从最新备份恢复
 
 ```powershell
@@ -117,6 +125,8 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `sync_backend.py`：保持 V1 命令和 PowerShell UI 兼容的入口
 - `codex_sync/cli.py`：V2 命令行入口
 - `codex_sync/local/repair_engine.py`：本地历史检查、修复、备份和恢复引擎
+- `codex_sync/attachments/probe.py`：只读图片和附件结构探测
+- `docs/ATTACHMENT-PROBE.md`：真实格式调查结果和 Probe 边界
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录
 

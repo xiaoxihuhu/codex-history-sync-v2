@@ -18,6 +18,14 @@
 - 保留 `sync_backend.py` 作为原 PowerShell UI、CLI 和测试的兼容入口。
 - 增加兼容层自动化测试，保证 V1 导出和命令名称不变。
 
+### Phase 3
+
+- 增加只读 `probe-attachments` 命令和 Attachment Probe。
+- 支持 Session 内嵌 `data:` 图片、本地图片路径、粘贴文本清单和归档 Session。
+- 使用 SHA256 关联同一图片的内嵌内容和本地缓存文件。
+- 输出 Thread、Session、Message、MIME、大小、路径、Hash、引用位置和存在状态。
+- 增加匿名化现代 Session fixture，并覆盖缺失文件、归档扫描和路径白名单测试。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。

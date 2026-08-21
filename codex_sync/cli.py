@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 
+from codex_sync.attachments import probe_attachments
 from codex_sync.local.repair_engine import (
     elapsed_ms,
     ensure_environment,
@@ -34,6 +35,15 @@ def build_parser() -> argparse.ArgumentParser:
     restore_parser = subparsers.add_parser("restore", help="Restore from a backup")
     restore_parser.add_argument("--backup", help="Backup file path; newest backup is used when omitted")
     subparsers.add_parser("backup", help="Create a manual backup")
+    probe_parser = subparsers.add_parser(
+        "probe-attachments",
+        help="Inspect local attachment and image references without modifying Codex data",
+    )
+    probe_parser.add_argument(
+        "--active-only",
+        action="store_true",
+        help="Skip archived session files",
+    )
     return parser
 
 
@@ -62,6 +72,11 @@ def main() -> int:
                 "backup_path": str(make_backup(paths, "manual")),
                 "timing": {"total_ms": elapsed_ms(backup_started_at)},
             }
+        elif args.command == "probe-attachments":
+            payload = probe_attachments(
+                paths.codex_home,
+                include_archived=not args.active_only,
+            ).to_dict()
         else:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except Exception as exc:
