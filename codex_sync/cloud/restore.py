@@ -13,6 +13,7 @@ class RestoreRepository(Protocol):
         user_id: str,
         access_token: str,
         codex_thread_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     def list_sessions(
@@ -34,10 +35,11 @@ class SupabaseRestoreRepository:
         user_id: str,
         access_token: str,
         codex_thread_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> list[dict[str, Any]]:
         query_values = {
             "select": (
-                "id,codex_thread_id,rollout_relative_path,title,source,model_provider,"
+                "id,codex_thread_id,workspace_id,rollout_relative_path,title,source,model_provider,"
                 "model,original_cwd,archived,codex_created_at,codex_updated_at,metadata"
             ),
             "user_id": f"eq.{user_id}",
@@ -45,6 +47,8 @@ class SupabaseRestoreRepository:
         }
         if codex_thread_id:
             query_values["codex_thread_id"] = f"eq.{codex_thread_id}"
+        if workspace_id:
+            query_values["workspace_id"] = f"eq.{workspace_id}"
         response = self.client.request_json(
             "GET",
             f"/rest/v1/threads?{urlencode(query_values)}",

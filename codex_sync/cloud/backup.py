@@ -15,6 +15,7 @@ class ManualUploadRepository(Protocol):
         device_id: str,
         threads: list[LocalThreadRecord],
         access_token: str,
+        workspace_ids: dict[str, str] | None = None,
     ) -> dict[str, str]: ...
 
     def list_sessions(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
@@ -46,13 +47,16 @@ class SupabaseManualUploadRepository:
         device_id: str,
         threads: list[LocalThreadRecord],
         access_token: str,
+        workspace_ids: dict[str, str] | None = None,
     ) -> dict[str, str]:
         if not threads:
             return {}
+        chosen_workspace_ids = workspace_ids or {}
         payload = [
             {
                 "user_id": user_id,
                 "codex_thread_id": item.codex_thread_id,
+                "workspace_id": chosen_workspace_ids.get(item.codex_thread_id),
                 "source_device_id": device_id,
                 "rollout_relative_path": item.rollout_relative_path,
                 "title": item.title,

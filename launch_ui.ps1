@@ -1,4 +1,4 @@
-﻿param(
+param(
   [switch]$InstallShortcutOnly,
   [switch]$SmokeTest
 )
@@ -27,7 +27,16 @@ function Invoke-Backend {
     throw "缺少后端脚本: $script:BackendPath"
   }
 
-  $output = & py -3 $script:BackendPath @Arguments 2>&1
+  $pythonLauncher = Get-Command py -ErrorAction SilentlyContinue
+  if ($pythonLauncher) {
+    $output = & $pythonLauncher.Source -3 $script:BackendPath @Arguments 2>&1
+  } else {
+    $pythonLauncher = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $pythonLauncher) {
+      throw '未找到 Python 3。请安装 Python 3.10 或更高版本。'
+    }
+    $output = & $pythonLauncher.Source $script:BackendPath @Arguments 2>&1
+  }
   $exitCode = $LASTEXITCODE
   $text = (($output | ForEach-Object { "$_" }) -join [Environment]::NewLine).Trim()
   if (-not $text) {
@@ -197,7 +206,6 @@ function Apply-State {
   $summaryLabel.Text = "历史线程: $($Status.total_threads)    会话文件: $($Status.session_file_count)    侧边栏索引: $($Status.indexed_threads)"
   $repairLabel.Text = "待修复: $($Status.movable_threads)    数据库: $($Status.movable_database_threads)    模型: $($Status.model_movable_threads)    会话文件: $($Status.movable_session_threads)    索引: $($Status.missing_session_index_entries)"
   $pathLabel.Text = "数据位置: $($Status.codex_home)"
-  $statusLabel.Text = Get-FriendlyStatus $Status
 
   $providersView.Items.Clear()
   foreach ($row in $Status.provider_counts) {

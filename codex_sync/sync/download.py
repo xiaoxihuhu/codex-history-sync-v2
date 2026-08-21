@@ -19,6 +19,11 @@ from codex_sync.local.restore_engine import (
     safe_restore_path,
 )
 
+
+class WorkspaceResolver:
+    def resolve_local_path(self, workspace_id: str) -> Path | None:
+        raise NotImplementedError
+
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -71,35 +76,71 @@ class ManualDownloadEngine:
         auth: AuthService,
         devices: DeviceService,
         repository: RestoreRepository,
+        workspaces: WorkspaceResolver | None = None,
     ) -> None:
         self.paths = paths
         self.auth = auth
         self.devices = devices
         self.repository = repository
+        self.workspaces = workspaces
 
     def restore(
         self,
         *,
         codex_thread_id: str | None = None,
+        workspace_id: str | None = None,
         target_cwd: Path | None = None,
     ) -> ManualDownloadSummary:
         ensure_environment(self.paths)
         session = self.auth.restore_session()
         if session is None:
             raise RuntimeError("Sign in to Codex Sync before restoring history")
-        chosen_cwd = (target_cwd or Path.home()).expanduser().resolve(strict=False)
-        if not chosen_cwd.is_dir():
-            raise RuntimeError(f"Target working directory does not exist: {chosen_cwd}")
+        override_cwd = (
+            target_cwd.expanduser().resolve(strict=False) if target_cwd else None
+        )
+        if override_cwd is not None and not override_cwd.is_dir():
+            raise RuntimeError(f"Target working directory does not exist: {override_cwd}")
 
         self.devices.register_current_device()
-        threads = self.repository.list_threads(
-            session.user.id,
-            session.access_token,
-            codex_thread_id,
-        )
-        if codex_thread_id and not threads:
+        if workspace_id:
+            threads = self.repository.list_threads(
+                session.user.id,
+                session.access_token,
+                codex_thread_id,
+                workspace_id,
+            )
+        else:
+            threads = self.repository.list_threads(
+                session.user.id,
+                session.access_token,
+                codex_thread_id,
+            )
+        if not threads and codex_thread_id:
             raise RuntimeError(f"Cloud Thread was not found: {codex_thread_id}")
+        if not threads and workspace_id:
+            raise RuntimeError(f"Cloud Workspace has no restorable Threads: {workspace_id}")
         sessions = self.repository.list_sessions(session.user.id, session.access_token)
+        target_cwds: dict[str, Path] = {}
+        for thread in threads:
+            local_thread_id = required_text(thread, "codex_thread_id", "Thread")
+            cloud_workspace_id = str(thread.get("workspace_id") or "").strip()
+            chosen_cwd = override_cwd
+            if chosen_cwd is None and cloud_workspace_id:
+                chosen_cwd = (
+                    self.workspaces.resolve_local_path(cloud_workspace_id)
+                    if self.workspaces
+                    else None
+                )
+                if chosen_cwd is None:
+                    raise RuntimeError(
+                        f"Workspace {cloud_workspace_id} is not mapped on this device"
+                    )
+                chosen_cwd = chosen_cwd.expanduser().resolve(strict=False)
+            if chosen_cwd is None:
+                chosen_cwd = Path.home().resolve(strict=False)
+            if not chosen_cwd.is_dir():
+                raise RuntimeError(f"Target working directory does not exist: {chosen_cwd}")
+            target_cwds[local_thread_id] = chosen_cwd
 
         prepared: list[PreparedTextRestore] = []
         downloaded_objects = 0
@@ -187,14 +228,11 @@ class ManualDownloadEngine:
                             if thread.get("codex_updated_at")
                             else None
                         ),
+                        target_cwd=target_cwds[local_thread_id],
                     )
                 )
 
-            local_summary = restore_text_history(
-                self.paths,
-                prepared,
-                target_cwd=chosen_cwd,
-            )
+            local_summary = restore_text_history(self.paths, prepared)
 
         return ManualDownloadSummary(
             cloud_threads=len(threads),

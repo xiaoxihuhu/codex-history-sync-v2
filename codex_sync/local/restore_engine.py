@@ -73,6 +73,7 @@ class PreparedTextRestore:
     archived: bool
     codex_created_at: str | None
     codex_updated_at: str | None
+    target_cwd: Path
 
 
 @dataclass(frozen=True)
@@ -337,14 +338,20 @@ def verify_restored_history(
 def restore_text_history(
     paths: Paths,
     entries: list[PreparedTextRestore],
-    *,
-    target_cwd: Path,
 ) -> LocalRestoreSummary:
     ensure_environment(paths)
     if not entries:
         return LocalRestoreSummary(0, 0, 0, 0, 0, 0, 0, None)
 
-    target_cwd = target_cwd.expanduser().resolve(strict=False)
+    target_cwds = {
+        entry.codex_thread_id: entry.target_cwd.expanduser().resolve(strict=False)
+        for entry in entries
+    }
+    missing_targets = [
+        target for target in target_cwds.values() if not target.is_dir()
+    ]
+    if missing_targets:
+        raise RuntimeError(f"Target working directory does not exist: {missing_targets[0]}")
     config_text = read_text(paths.config_path)
     current_provider = parse_current_provider(config_text, paths)
     current_model = parse_current_model(config_text, paths)
@@ -373,6 +380,7 @@ def restore_text_history(
     existing_sessions = 0
 
     for entry in entries:
+        target_cwd = target_cwds[entry.codex_thread_id]
         if entry.codex_thread_id in target_paths:
             raise RuntimeError(f"Cloud restore manifest duplicates Thread {entry.codex_thread_id}")
         target = safe_restore_path(paths.codex_home, entry.relative_path)

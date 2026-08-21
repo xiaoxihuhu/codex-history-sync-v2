@@ -66,8 +66,16 @@ class MemoryCloudRepository:
         self.objects: dict[str, bytes] = {}
         self.download_calls = 0
 
-    def upsert_threads(self, user_id, device_id, threads, access_token):
+    def upsert_threads(
+        self,
+        user_id,
+        device_id,
+        threads,
+        access_token,
+        workspace_ids=None,
+    ):
         mapping = {}
+        workspace_ids = workspace_ids or {}
         for item in threads:
             cloud_id = f"cloud-{item.codex_thread_id}"
             mapping[item.codex_thread_id] = cloud_id
@@ -75,6 +83,7 @@ class MemoryCloudRepository:
                 "id": cloud_id,
                 "user_id": user_id,
                 "codex_thread_id": item.codex_thread_id,
+                "workspace_id": workspace_ids.get(item.codex_thread_id),
                 "rollout_relative_path": item.rollout_relative_path,
                 "title": item.title,
                 "source": item.source,
@@ -88,10 +97,18 @@ class MemoryCloudRepository:
             }
         return mapping
 
-    def list_threads(self, user_id, access_token, codex_thread_id=None):
+    def list_threads(
+        self,
+        user_id,
+        access_token,
+        codex_thread_id=None,
+        workspace_id=None,
+    ):
         rows = list(self.threads.values())
         if codex_thread_id:
             rows = [row for row in rows if row["codex_thread_id"] == codex_thread_id]
+        if workspace_id:
+            rows = [row for row in rows if row.get("workspace_id") == workspace_id]
         return rows
 
     def list_sessions(self, user_id, access_token):

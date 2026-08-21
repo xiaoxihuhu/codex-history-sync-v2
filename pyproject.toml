@@ -14,8 +14,13 @@ authors = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+build = ["PyInstaller>=6.0", "build>=1.2"]
+
 [project.scripts]
 codex-history-sync = "codex_sync.cli:main"
+codex-history-sync-gui = "codex_sync.gui:main"
 
 [tool.setuptools.packages.find]
 include = ["codex_sync*"]

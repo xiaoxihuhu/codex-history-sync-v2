@@ -163,7 +163,7 @@ class SyncStateTests(unittest.TestCase):
             self.assertEqual(first.client_version, __version__)
 
             with closing(sqlite3.connect(paths.state_db_path)) as conn:
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
 
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
     def test_windows_dpapi_round_trip(self) -> None:

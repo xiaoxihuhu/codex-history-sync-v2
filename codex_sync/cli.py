@@ -16,6 +16,8 @@ from codex_sync.cloud import (
     SupabaseDeviceRepository,
     SupabaseManualUploadRepository,
     SupabaseRestoreRepository,
+    SupabaseSnapshotRepository,
+    SupabaseWorkspaceRepository,
 )
 from codex_sync.config import (
     SupabaseConfig,
@@ -37,6 +39,8 @@ from codex_sync.sync.download import ManualDownloadEngine
 from codex_sync.sync.download_attachments import AttachmentDownloadEngine
 from codex_sync.sync.upload import ManualUploadEngine
 from codex_sync.sync.upload_attachments import AttachmentUploadEngine
+from codex_sync.workspace import WorkspaceManager
+from codex_sync.versioning import CombinedSnapshotSource, SnapshotManager
 
 
 def to_json(payload: dict[str, object]) -> str:
@@ -81,16 +85,46 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("device-info", help="Show this installation's persistent device identity")
     subparsers.add_parser("device-register", help="Register or refresh this device in Supabase")
     subparsers.add_parser("device-list", help="List devices for the current Codex Sync account")
+    subparsers.add_parser(
+        "queue-status",
+        help="Show local pending and completed upload queue items",
+    )
     subparsers.add_parser("cloud-backup", help="Upload local Thread metadata and changed Session JSONL files")
+    snapshot_create_parser = subparsers.add_parser(
+        "cloud-snapshot-create",
+        help="Create a manual cloud version Snapshot",
+    )
+    snapshot_create_parser.add_argument("--label")
+    snapshot_create_parser.add_argument("--workspace-id")
+    subparsers.add_parser("cloud-snapshot-list", help="List cloud version Snapshots")
     restore_cloud_parser = subparsers.add_parser(
         "cloud-restore",
         help="Restore missing plain-text Thread and Session history from Supabase",
     )
     restore_cloud_parser.add_argument("--thread-id", help="Restore only one Codex Thread ID")
+    restore_cloud_parser.add_argument("--workspace-id", help="Restore only one logical Workspace")
     restore_cloud_parser.add_argument(
         "--target-cwd",
-        help="Local working directory assigned to restored Threads (defaults to the user home)",
+        help="Override the mapped working directory for restored Threads",
     )
+    snapshot_restore_parser = subparsers.add_parser(
+        "cloud-snapshot-restore",
+        help="Restore plain-text history from a selected cloud Snapshot",
+    )
+    snapshot_restore_parser.add_argument("--snapshot-id", required=True)
+    snapshot_restore_parser.add_argument("--thread-id")
+    snapshot_restore_parser.add_argument("--workspace-id")
+    snapshot_restore_parser.add_argument("--target-cwd")
+    subparsers.add_parser(
+        "workspace-list",
+        help="List cloud Workspaces and this device's local mappings",
+    )
+    workspace_map_parser = subparsers.add_parser(
+        "workspace-map",
+        help="Map a cloud Workspace to a local working directory",
+    )
+    workspace_map_parser.add_argument("--workspace-id", required=True)
+    workspace_map_parser.add_argument("--path", required=True)
     subparsers.add_parser(
         "cloud-upload-attachments",
         help="Upload local images and attachments by SHA256 after Thread/Session backup",
@@ -152,8 +186,14 @@ def main() -> int:
             "device-info",
             "device-register",
             "device-list",
+            "queue-status",
             "cloud-backup",
+            "cloud-snapshot-create",
+            "cloud-snapshot-list",
+            "cloud-snapshot-restore",
             "cloud-restore",
+            "workspace-list",
+            "workspace-map",
             "cloud-upload-attachments",
             "cloud-restore-attachments",
         }:
@@ -163,6 +203,11 @@ def main() -> int:
                 payload = {
                     "action": "device-info",
                     "device": state.get_or_create_device(__version__).to_dict(),
+                }
+            elif args.command == "queue-status":
+                payload = {
+                    "action": "queue-status",
+                    "queue": [item.to_dict() for item in state.list_upload_queue()],
                 }
             else:
                 config = load_supabase_config(app_paths)
@@ -206,10 +251,65 @@ def main() -> int:
                         auth,
                         devices,
                         SupabaseManualUploadRepository(client),
+                        WorkspaceManager(
+                            auth,
+                            devices,
+                            state,
+                            SupabaseWorkspaceRepository(client),
+                        ),
+                        state,
                     ).upload()
+                    snapshot = SnapshotManager(
+                        auth,
+                        devices,
+                        SupabaseSnapshotRepository(client),
+                        CombinedSnapshotSource(
+                            SupabaseRestoreRepository(client),
+                            SupabaseAttachmentRepository(client),
+                        ),
+                        SupabaseRestoreRepository(client),
+                    ).create(
+                        snapshot_type="automatic",
+                        label="cloud-backup",
+                    )
                     payload = {
                         "action": "cloud-backup",
                         "summary": summary.to_dict(),
+                        "snapshot": snapshot,
+                    }
+                elif args.command == "cloud-snapshot-create":
+                    snapshot = SnapshotManager(
+                        auth,
+                        devices,
+                        SupabaseSnapshotRepository(client),
+                        CombinedSnapshotSource(
+                            SupabaseRestoreRepository(client),
+                            SupabaseAttachmentRepository(client),
+                        ),
+                        SupabaseRestoreRepository(client),
+                    ).create(
+                        snapshot_type="manual",
+                        label=args.label,
+                        workspace_id=args.workspace_id,
+                    )
+                    payload = {
+                        "action": "cloud-snapshot-create",
+                        "snapshot": snapshot,
+                    }
+                elif args.command == "cloud-snapshot-list":
+                    snapshots = SnapshotManager(
+                        auth,
+                        devices,
+                        SupabaseSnapshotRepository(client),
+                        CombinedSnapshotSource(
+                            SupabaseRestoreRepository(client),
+                            SupabaseAttachmentRepository(client),
+                        ),
+                        SupabaseRestoreRepository(client),
+                    ).list()
+                    payload = {
+                        "action": "cloud-snapshot-list",
+                        "snapshots": snapshots,
                     }
                 elif args.command == "cloud-restore":
                     summary = ManualDownloadEngine(
@@ -217,13 +317,77 @@ def main() -> int:
                         auth,
                         devices,
                         SupabaseRestoreRepository(client),
+                        WorkspaceManager(
+                            auth,
+                            devices,
+                            state,
+                            SupabaseWorkspaceRepository(client),
+                        ),
                     ).restore(
                         codex_thread_id=args.thread_id,
+                        workspace_id=args.workspace_id,
                         target_cwd=Path(args.target_cwd) if args.target_cwd else None,
                     )
                     payload = {
                         "action": "cloud-restore",
                         "summary": summary.to_dict(),
+                    }
+                elif args.command == "cloud-snapshot-restore":
+                    snapshot_manager = SnapshotManager(
+                        auth,
+                        devices,
+                        SupabaseSnapshotRepository(client),
+                        CombinedSnapshotSource(
+                            SupabaseRestoreRepository(client),
+                            SupabaseAttachmentRepository(client),
+                        ),
+                        SupabaseRestoreRepository(client),
+                    )
+                    summary = ManualDownloadEngine(
+                        paths,
+                        auth,
+                        devices,
+                        snapshot_manager.load_restore_repository(args.snapshot_id),
+                        WorkspaceManager(
+                            auth,
+                            devices,
+                            state,
+                            SupabaseWorkspaceRepository(client),
+                        ),
+                    ).restore(
+                        codex_thread_id=args.thread_id,
+                        workspace_id=args.workspace_id,
+                        target_cwd=Path(args.target_cwd) if args.target_cwd else None,
+                    )
+                    payload = {
+                        "action": "cloud-snapshot-restore",
+                        "snapshot_id": args.snapshot_id,
+                        "summary": summary.to_dict(),
+                    }
+                elif args.command == "workspace-list":
+                    manager = WorkspaceManager(
+                        auth,
+                        devices,
+                        state,
+                        SupabaseWorkspaceRepository(client),
+                    )
+                    payload = {
+                        "action": "workspace-list",
+                        "workspaces": manager.list_workspaces(),
+                    }
+                elif args.command == "workspace-map":
+                    manager = WorkspaceManager(
+                        auth,
+                        devices,
+                        state,
+                        SupabaseWorkspaceRepository(client),
+                    )
+                    payload = {
+                        "action": "workspace-map",
+                        "mapping": manager.map_workspace(
+                            args.workspace_id,
+                            Path(args.path),
+                        ),
                     }
                 elif args.command == "cloud-upload-attachments":
                     summary = AttachmentUploadEngine(

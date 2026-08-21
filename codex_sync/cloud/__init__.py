@@ -6,6 +6,8 @@ from .backup import SupabaseManualUploadRepository
 from .devices import DeviceService, SupabaseDeviceRepository
 from .restore import SupabaseRestoreRepository
 from .supabase_client import SupabaseClient, SupabaseError
+from .snapshots import SupabaseSnapshotRepository
+from .workspaces import SupabaseWorkspaceRepository
 
 __all__ = [
     "AuthService",
@@ -13,7 +15,9 @@ __all__ = [
     "SupabaseAttachmentRepository",
     "SupabaseManualUploadRepository",
     "SupabaseRestoreRepository",
+    "SupabaseWorkspaceRepository",
     "SupabaseClient",
     "SupabaseDeviceRepository",
     "SupabaseError",
+    "SupabaseSnapshotRepository",
 ]

@@ -32,7 +32,11 @@ class CompatibilityTests(unittest.TestCase):
             "device-info",
             "device-register",
             "device-list",
+            "queue-status",
             "cloud-backup",
+            "cloud-snapshot-create",
+            "cloud-snapshot-list",
+            "cloud-snapshot-restore",
             "cloud-restore",
             "cloud-upload-attachments",
             "cloud-restore-attachments",
@@ -42,6 +46,8 @@ class CompatibilityTests(unittest.TestCase):
                 command_args += ["--url", "https://example.supabase.co"]
             elif command in {"auth-sign-up", "auth-sign-in"}:
                 command_args += ["--email", "user@example.com"]
+            elif command == "cloud-snapshot-restore":
+                command_args += ["--snapshot-id", "cccccccc-cccc-4ccc-8ccc-cccccccccccc"]
             args = parser.parse_args(command_args)
             self.assertEqual(args.command, command)
 

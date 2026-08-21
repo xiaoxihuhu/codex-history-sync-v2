@@ -85,6 +85,49 @@
 - Session 写入失败时恢复原始字节并删除本轮新附件，回滚动作逐项执行。
 - 增加图片、TXT、PDF、不同电脑路径、引用修复和故障回滚测试。
 
+### Phase 10
+
+- 增加逻辑 Workspace ID 和跨 Windows 用户名、磁盘路径的稳定归属。
+- 在独立 `sync_state.sqlite` 中保存当前设备的 Workspace 本地目录映射。
+- `cloud-backup` 上传 Workspace、来源设备路径，并将 Thread 关联到 `workspace_id`。
+- `cloud-restore` 支持按 Workspace 过滤，并按每条 Thread 的映射分别恢复 cwd。
+- 增加 Workspace 列表和本机目录映射命令。
+- 未映射 Workspace 会在本地备份和写入前失败，避免产生半恢复状态。
+- 增加多 Workspace 不同目标路径、未映射拒绝、UUID 稳定性和 REST 请求契约测试。
+
+### Phase 11
+
+- 增加 Session Manifest，集中记录对象类型、稳定键、路径、size、mtime 和 SHA256。
+- 在独立 `sync_state.sqlite` 保存 `sync_objects`，云端校验成功后更新最后上传 Hash 和时间。
+- 保留云端 Hash 去重，变化 Session 才会产生 Storage/Session upsert。
+- 增加 Manifest 状态持久化和更新前后 Hash 测试。
+
+### Phase 12
+
+- 增加独立 SQLite 上传队列，保存 pending/completed、尝试次数、下次重试时间和脱敏错误摘要。
+- 网络或云端校验失败时进入指数退避队列，应用重启后任务仍然保留。
+- 增加 `queue-status` 命令，供 GUI 和计划任务读取。
+- 队列不会写入 Auth Token、密码或 API Key。
+
+### Phase 13
+
+- 增加自动/手动 Snapshot 创建、列表和 Manifest Hash 校验。
+- Snapshot Manifest 保存 Thread、Session、Attachment 和引用清单，使用私有 Storage 用户目录。
+- 增加按 Snapshot 恢复纯文本历史，并复用 Workspace Mapping、Local Repair Engine 和安全回滚。
+- Snapshot 上传失败会标记为 `failed`，不会伪报成功。
+
+### Phase 14
+
+- 保留 PowerShell V1 GUI 兼容入口。
+- 增加可选 PySide6 概览 GUI，提供本地修复、云端备份/恢复、Workspace、队列和 Snapshot 操作页面。
+- PySide6 未安装时 GUI 明确提示安装可选依赖，不影响标准库 CLI。
+
+### Phase 15
+
+- 增加 Windows smoke test 和 PyInstaller EXE 构建脚本。
+- 构建脚本执行 Python 版本检查、全量测试、可选依赖检查和产物存在性验证。
+- 修正 Windows 脚本在 `py` 启动器不可用时回退到 `python`。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
@@ -98,6 +141,7 @@
 
 ### 安全与兼容性
 
-- 当根目录和 `sqlite` 子目录的数据库同时存在时，根据数据库及其 WAL 的最近活动时间选择实际使用中的数据库。
+- 当根目录和 `sqlite` 子目录的数据库同时存在时，根据数据库及其 WAL 的最近活动时间选择实际使用中的那个；
 - 配置缺少 `model_provider` 时安全回退到官方默认值 `openai`，不再从旧历史数据猜测当前 Provider。
 - 配置与命令行都未指定 Model 时保留线程原有模型，不做批量改写。
+
