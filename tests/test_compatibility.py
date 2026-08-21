@@ -51,8 +51,8 @@ class CompatibilityTests(unittest.TestCase):
             args = parser.parse_args(command_args)
             self.assertEqual(args.command, command)
 
-    def test_v2_package_has_development_version(self) -> None:
-        self.assertEqual(__version__, "2.0.0.dev0")
+    def test_v2_package_has_release_version(self) -> None:
+        self.assertEqual(__version__, "2.0.0")
 
 
 if __name__ == "__main__":

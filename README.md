@@ -124,7 +124,7 @@ py -3 .\sync_backend.py --json cloud-backup
 
 该命令只读扫描 Codex 状态数据库，通过白名单上传 Thread 元数据，并把 Session JSONL 按 SHA256 内容寻址保存到私有 Storage。未变化的 Session 不会重复上传；上传后会重新读取云端 Session 清单并逐项校验 Hash，验证成功后才更新设备的 `last_backup_at`。
 
-当前连接的 Supabase 原型 Schema 与仓库中的 V2 migrations 不兼容。必须先在干净项目部署 `migrations/001` 至 `009`，或完成经过审查的兼容迁移，才能实际执行该命令。详见 `docs/MANUAL-CLOUD-BACKUP.md`。
+正式 V2 部署应使用与旧原型项目隔离的 Supabase 项目，并先部署仓库中的 `migrations/001` 至 `009`。不要将旧原型 Schema 作为 V2 数据库使用。详见 `docs/MANUAL-CLOUD-BACKUP.md`。
 
 ### 从云端恢复纯文本历史
 

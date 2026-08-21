@@ -2,6 +2,25 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.0] - 2026-08-21
+
+- Codex 本地历史修复
+- Supabase 云端备份
+- 跨电脑恢复
+- Thread / Session 同步
+- Workspace Mapping
+- 图片和附件同步
+- SHA256 去重和验证
+- PNG / TXT / XLSX / PDF 支持
+- 自动增量状态
+- 持久上传队列
+- Snapshot 云端版本
+- Local Backup / Rollback
+- PySide6 GUI
+- Windows EXE
+- RLS / Private Storage
+- 长 Windows 路径兼容
+
 ## [Unreleased]
 
 ### Phase 1
