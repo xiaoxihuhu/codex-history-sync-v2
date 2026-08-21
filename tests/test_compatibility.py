@@ -34,6 +34,7 @@ class CompatibilityTests(unittest.TestCase):
             "device-list",
             "cloud-backup",
             "cloud-restore",
+            "cloud-upload-attachments",
         ):
             command_args = [command]
             if command == "cloud-configure":

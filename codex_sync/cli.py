@@ -11,6 +11,7 @@ from codex_sync.attachments import probe_attachments
 from codex_sync.cloud import (
     AuthService,
     DeviceService,
+    SupabaseAttachmentRepository,
     SupabaseClient,
     SupabaseDeviceRepository,
     SupabaseManualUploadRepository,
@@ -34,6 +35,7 @@ from codex_sync.local.repair_engine import (
 from codex_sync.sync import SyncStateStore
 from codex_sync.sync.download import ManualDownloadEngine
 from codex_sync.sync.upload import ManualUploadEngine
+from codex_sync.sync.upload_attachments import AttachmentUploadEngine
 
 
 def to_json(payload: dict[str, object]) -> str:
@@ -87,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     restore_cloud_parser.add_argument(
         "--target-cwd",
         help="Local working directory assigned to restored Threads (defaults to the user home)",
+    )
+    subparsers.add_parser(
+        "cloud-upload-attachments",
+        help="Upload local images and attachments by SHA256 after Thread/Session backup",
     )
     return parser
 
@@ -143,6 +149,7 @@ def main() -> int:
             "device-list",
             "cloud-backup",
             "cloud-restore",
+            "cloud-upload-attachments",
         }:
             app_paths = default_app_paths()
             state = SyncStateStore(app_paths)
@@ -210,6 +217,17 @@ def main() -> int:
                     )
                     payload = {
                         "action": "cloud-restore",
+                        "summary": summary.to_dict(),
+                    }
+                elif args.command == "cloud-upload-attachments":
+                    summary = AttachmentUploadEngine(
+                        paths,
+                        auth,
+                        devices,
+                        SupabaseAttachmentRepository(client),
+                    ).upload()
+                    payload = {
+                        "action": "cloud-upload-attachments",
                         "summary": summary.to_dict(),
                     }
                 else:

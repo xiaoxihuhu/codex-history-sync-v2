@@ -91,6 +91,10 @@ class AttachmentProbeTests(unittest.TestCase):
             self.assertEqual(len(image_records), 2)
             self.assertEqual({item.sha256 for item in image_records}, {sha256_bytes(image_bytes)})
             self.assertEqual({item.reference_kind for item in image_records}, {"embedded_data", "local_images"})
+            self.assertTrue(
+                any(item.embedded_content == image_bytes for item in image_records)
+            )
+            self.assertNotIn("embedded_content", result.to_dict()["attachments"][0])
 
             related_records = [item for item in result.attachments if item.message_id == "message-fixture-001"]
             self.assertEqual(len(related_records), 3)

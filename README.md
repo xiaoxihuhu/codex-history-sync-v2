@@ -29,7 +29,7 @@
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
 
-V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices、Thread / Session 手动增量上传，以及纯文本历史下载恢复。
+V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices、Thread / Session 手动增量上传、纯文本历史下载恢复，以及图片/附件去重上传。
 
 ## 运行环境
 
@@ -138,6 +138,18 @@ py -3 .\sync_backend.py --json cloud-restore --target-cwd E:\Work\Recovered
 
 目标 `.codex` 必须先由 Codex Desktop 初始化。当前阶段只恢复纯文本 Thread / Session；图片、附件和完整 Workspace Mapping 在后续阶段实现。详见 `docs/PURE-TEXT-CLOUD-RESTORE.md`。
 
+### 上传图片和附件
+
+先执行 `cloud-backup`，再运行：
+
+```powershell
+py -3 .\sync_backend.py --json cloud-upload-attachments
+```
+
+命令通过 Attachment Probe 扫描本地文件和内嵌 `data:` 图片，按 SHA256 去重后上传到私有 Storage，并保存每条 Thread / Session / Message 引用。相同 Hash 的内嵌图片和本地缓存只上传一次；缺失文件、远程 URL 和待删除记录不会上传。
+
+当前阶段只完成附件上传，下载、目标机路径重建和 Session 引用修复在 Phase 9 实现。详见 `docs/ATTACHMENT-CLOUD-UPLOAD.md`。
+
 ### 从最新备份恢复
 
 ```powershell
@@ -185,6 +197,7 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `docs/AUTH-AND-DEVICES.md`：账号、DPAPI Session 和设备系统
 - `docs/MANUAL-CLOUD-BACKUP.md`：Thread / Session 手动上传、增量判断和验证规则
 - `docs/PURE-TEXT-CLOUD-RESTORE.md`：纯文本云端下载、目标 Schema 适配和失败回滚
+- `docs/ATTACHMENT-CLOUD-UPLOAD.md`：图片/附件内容寻址、去重和引用上传
 - `docs/SUPABASE-COMPATIBILITY-AUDIT.md`：现有 Supabase 原型 Schema 的只读兼容审计
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录

@@ -64,6 +64,17 @@
 - 恢复完成后验证 SQLite、Thread、Session ID 和活动 Session 索引。
 - 增加 TestComputerA → Cloud → TestComputerB、指定 Thread、损坏对象和失败回滚测试。
 
+### Phase 8
+
+- 增加 `cloud-upload-attachments`，上传 Probe 确认存在的图片和附件。
+- 使用 `users/USER_ID/attachments/HASH_PREFIX/SHA256.ext` 私有 Storage 路径。
+- `attachments` 按用户和 SHA256 去重，`attachment_references` 保留全部消息和清单引用。
+- 同一图片的内嵌 `data:` 内容与本地缓存只上传一个对象。
+- 支持已知图片、文档、压缩包扩展名，未知或不安全扩展名回退为 `.bin`。
+- 缺失文件、远程 URL 和待删除清单记录不上传；缺少云端 Thread/Session 时提前失败。
+- 上传后验证云端 Hash 实体和引用位置，成功后才更新设备备份时间。
+- 增加 PNG、TXT、PDF、重复 Hash、二次增量和 Supabase Storage 请求契约测试。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。

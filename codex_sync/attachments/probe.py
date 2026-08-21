@@ -5,7 +5,7 @@ import binascii
 import json
 import mimetypes
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -48,9 +48,12 @@ class AttachmentProbeRecord:
     reference_location: str
     reference_kind: str
     exists: bool
+    embedded_content: bytes | None = field(default=None, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        payload = asdict(self)
+        payload.pop("embedded_content", None)
+        return payload
 
 
 @dataclass(frozen=True)
@@ -181,6 +184,7 @@ def record_from_reference(
             reference_location=context.reference_location,
             reference_kind="embedded_data",
             exists=True,
+            embedded_content=content,
         )
 
     path = normalize_local_path(value, codex_home)
