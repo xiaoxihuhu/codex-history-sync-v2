@@ -1,0 +1,3 @@
+# Core runtime uses the Python standard library only.
+# Optional GUI: python -m pip install .[gui]
+# Optional Windows EXE build: python -m pip install .[gui,build]

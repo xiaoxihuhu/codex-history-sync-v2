@@ -20,14 +20,16 @@
 - 你切换了不同 API
 - 你切换了不同 provider
 - 你切换了不同模型
-- 你切换了登录方式
+- 你切换了不同登录方式
 - 你确认本地历史文件还在，但 Codex Desktop 左侧历史列表变空了
 
-## 不适用的场景
+## V1 不适用的场景
 
 - 云端账号之间的聊天记录互相同步
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
+
+V2 已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices、Thread / Session 上传与纯文本恢复、图片/附件上传、Workspace Mapping、Manifest/增量状态、持久队列、Snapshot 版本管理，以及可选 PySide6 GUI 和 Windows 构建自检。
 
 ## 运行环境
 
@@ -77,10 +79,162 @@ py -3 .\sync_backend.py --json sync --provider your-provider --model your-model
 py -3 .\sync_backend.py --json backup
 ```
 
+### 探测图片和附件
+
+```powershell
+py -3 .\sync_backend.py --json probe-attachments
+```
+
+该命令只读扫描 Session JSONL、归档 Session、Codex 附件清单、内嵌图片和本地图片路径，输出 Thread / Session / Message 关联、文件类型、大小、SHA256、引用位置和文件存在状态。它不会输出内嵌图片正文，也不会把普通项目路径和命令输出路径当作附件。
+
+### 配置 Codex Sync 云端账号
+
+```powershell
+py -3 .\sync_backend.py --json cloud-configure --url https://PROJECT.supabase.co
+```
+
+命令会隐藏输入客户端可公开使用的 Supabase publishable/anon key。桌面客户端会拒绝 secret/service-role key。
+
+### 注册、登录和查看账号
+
+```powershell
+py -3 .\sync_backend.py --json auth-sign-up --email user@example.com
+py -3 .\sync_backend.py --json auth-sign-in --email user@example.com
+py -3 .\sync_backend.py --json auth-status
+py -3 .\sync_backend.py --json auth-sign-out
+```
+
+密码只通过隐藏提示读取。登录 Session 使用 Windows DPAPI 加密后保存在 `%LOCALAPPDATA%\CodexHistorySync\sync_state.sqlite`。
+
+### 本机设备
+
+```powershell
+py -3 .\sync_backend.py --json device-info
+py -3 .\sync_backend.py --json device-register
+py -3 .\sync_backend.py --json device-list
+```
+
+第一次运行会生成稳定的本机 `device_id`。云端注册和列表需要先完成 Supabase V2 兼容迁移与登录。
+
+### 手动上传 Thread 和 Session
+
+```powershell
+py -3 .\sync_backend.py --json cloud-backup
+```
+
+该命令只读扫描 Codex 状态数据库，通过白名单上传 Thread 元数据，并把 Session JSONL 按 SHA256 内容寻址保存到私有 Storage。未变化的 Session 不会重复上传；上传后会重新读取云端 Session 清单并逐项校验 Hash，验证成功后才更新设备的 `last_backup_at`。
+
+正式 V2 部署应使用与旧原型项目隔离的 Supabase 项目，并先部署仓库中的 `migrations/001` 至 `009`。不要将旧原型 Schema 作为 V2 数据库使用。详见 `docs/MANUAL-CLOUD-BACKUP.md`。
+
+### 从云端恢复纯文本历史
+
+```powershell
+py -3 .\sync_backend.py --json cloud-restore
+py -3 .\sync_backend.py --json cloud-restore --thread-id THREAD_UUID
+py -3 .\sync_backend.py --json cloud-restore --target-cwd E:\Work\Recovered
+```
+
+恢复命令只下载本机缺失的 Session，先在临时目录校验大小、SHA256 和 `session_meta`，再创建本地安全备份并写入。恢复失败会还原数据库和索引，并删除本轮新建的 Session。目标机 Provider / Model 会通过 Local Repair Engine 修复。
+
+目标 `.codex` 必须先由 Codex Desktop 初始化。恢复时默认按每个 Thread 的 Workspace Mapping 选择目标 cwd；也可以用 `--target-cwd` 对本轮恢复做显式覆盖。详见 `docs/PURE-TEXT-CLOUD-RESTORE.md` 和 `docs/WORKSPACE-MAPPING.md`。
+
+### Workspace Mapping
+
+查看云端 Workspace 及当前设备映射：
+
+```powershell
+py -3 .\sync_backend.py --json workspace-list
+```
+
+将云端 Workspace 映射到新电脑的实际目录：
+
+```powershell
+py -3 .\sync_backend.py --json workspace-map `
+  --workspace-id WORKSPACE_UUID `
+  --path E:\Work\Recovered
+```
+
+恢复全部历史或指定 Workspace：
+
+```powershell
+py -3 .\sync_backend.py --json cloud-restore
+py -3 .\sync_backend.py --json cloud-restore --workspace-id WORKSPACE_UUID
+```
+
+未映射 Workspace 会在恢复写入前拒绝执行；`--target-cwd` 仍可作为一次性的统一目录覆盖。
+
+### 上传图片和附件
+
+先执行 `cloud-backup`，再运行：
+
+```powershell
+py -3 .\sync_backend.py --json cloud-upload-attachments
+```
+
+命令通过 Attachment Probe 扫描本地文件和内嵌 `data:` 图片，按 SHA256 去重后上传到私有 Storage，并保存每条 Thread / Session / Message 引用。相同 Hash 的内嵌图片和本地缓存只上传一次；缺失文件、远程 URL 和待删除记录不会上传。
+
+附件上传的内容寻址、去重和引用规则详见 `docs/ATTACHMENT-CLOUD-UPLOAD.md`。
+
+### 恢复图片和附件
+
+完成 `cloud-restore` 后运行：
+
+```powershell
+py -3 .\sync_backend.py --json cloud-restore-attachments
+```
+
+附件会下载到目标机 `.codex/restored_attachments` 的 SHA256 内容寻址目录，Session 中记录的旧电脑路径会被原子替换。失败时恢复原 Session 并删除本轮新文件。详见 `docs/ATTACHMENT-CLOUD-RESTORE.md`。
+
 ### 从最新备份恢复
 
 ```powershell
 py -3 .\sync_backend.py --json restore
+```
+
+### 队列和云端版本
+
+查看本机上传队列：
+
+```powershell
+py -3 .\sync_backend.py --json queue-status
+```
+
+创建、查看和恢复云端 Snapshot：
+
+```powershell
+py -3 .\sync_backend.py --json cloud-snapshot-create --label "before-migration"
+py -3 .\sync_backend.py --json cloud-snapshot-list
+py -3 .\sync_backend.py --json cloud-snapshot-restore --snapshot-id SNAPSHOT_UUID
+```
+
+Snapshot 恢复仍遵循 Workspace Mapping；未映射 Workspace 会在本地安全备份和写入前失败。
+
+### PySide6 GUI 和 Windows EXE
+
+保留 V1 PowerShell UI：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_ui.ps1
+```
+
+安装并运行 V2 GUI：
+
+```powershell
+python -m pip install .[gui]
+python .\launch_gui.py
+```
+
+执行 Windows 自检：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows_smoke_test.ps1
+```
+
+构建单文件 EXE（需要 PySide6 和 PyInstaller）：
+
+```powershell
+python -m pip install .[gui,build]
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_windows.ps1
 ```
 
 ### 运行测试
@@ -114,7 +268,24 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 
 ## 项目文件
 
-- `sync_backend.py`：后端同步、备份、恢复逻辑
+- `sync_backend.py`：保持 V1 命令和 PowerShell UI 兼容的入口
+- `codex_sync/cli.py`：V2 命令行入口
+- `codex_sync/local/repair_engine.py`：本地历史检查、修复、备份和恢复引擎
+- `codex_sync/attachments/probe.py`：只读图片和附件结构探测
+- `docs/ATTACHMENT-PROBE.md`：真实格式调查结果和 Probe 边界
+- `migrations/`：Supabase PostgreSQL、RLS 和 Storage 策略
+- `docs/SUPABASE-SCHEMA.md`：云端 Schema、所有权和上线验证说明
+- `docs/AUTH-AND-DEVICES.md`：账号、DPAPI Session 和设备系统
+- `docs/MANUAL-CLOUD-BACKUP.md`：Thread / Session 手动上传、增量判断和验证规则
+- `docs/PURE-TEXT-CLOUD-RESTORE.md`：纯文本云端下载、目标 Schema 适配和失败回滚
+- `docs/ATTACHMENT-CLOUD-UPLOAD.md`：图片/附件内容寻址、去重和引用上传
+- `docs/ATTACHMENT-CLOUD-RESTORE.md`：附件下载、新本机路径和 Session 引用回滚
+- `docs/WORKSPACE-MAPPING.md`：跨设备 Workspace 路径映射和恢复规则
+- `docs/OPERATIONS-V2.md`：Manifest、队列、Snapshot 和 Windows 构建操作说明
+- `launch_gui.py` / `codex_sync/gui.py`：可选 PySide6 V2 GUI
+- `scripts/windows_smoke_test.ps1`：Windows Python、CLI 和测试自检
+- `scripts/build_windows.ps1`：PyInstaller EXE 构建与产物检查
+- `docs/SUPABASE-COMPATIBILITY-AUDIT.md`：现有 Supabase 原型 Schema 的只读兼容审计
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录
 

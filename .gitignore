@@ -4,9 +4,13 @@ __pycache__/
 *.pyd
 *.bak
 *.lnk
+build/
+dist/
+*.egg-info/
 Thumbs.db
 .DS_Store
 
 # Local Codex data and generated backups should never be committed.
 .codex/
 history_sync_backups/
+acceptance_artifacts/
