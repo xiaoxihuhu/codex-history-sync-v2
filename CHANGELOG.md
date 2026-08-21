@@ -2,6 +2,15 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [Unreleased]
+
+### Phase 1
+
+- 完成 Fork、remote、分支和 V1 稳定基线审计。
+- 在 `v1-stable` tag 固定 V1 基线，保留原有 11 个测试。
+- 记录真实 Codex `state_5.sqlite`、WAL、Session JSONL、归档目录和附件引用结构。
+- 确认 V2 采用白名单提取、SHA256 内容寻址和 Adapter 兼容层，不上传整个 `.codex`。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
