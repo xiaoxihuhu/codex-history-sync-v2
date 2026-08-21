@@ -114,7 +114,9 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 
 ## 项目文件
 
-- `sync_backend.py`：后端同步、备份、恢复逻辑
+- `sync_backend.py`：保持 V1 命令和 PowerShell UI 兼容的入口
+- `codex_sync/cli.py`：V2 命令行入口
+- `codex_sync/local/repair_engine.py`：本地历史检查、修复、备份和恢复引擎
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录
 

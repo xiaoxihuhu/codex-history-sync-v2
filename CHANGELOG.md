@@ -11,6 +11,13 @@
 - 记录真实 Codex `state_5.sqlite`、WAL、Session JSONL、归档目录和附件引用结构。
 - 确认 V2 采用白名单提取、SHA256 内容寻址和 Adapter 兼容层，不上传整个 `.codex`。
 
+### Phase 2
+
+- 建立 `codex_sync` Python 包和 `Local Repair Engine` 模块边界。
+- 将 V1 命令行解析从本地修复实现中分离。
+- 保留 `sync_backend.py` 作为原 PowerShell UI、CLI 和测试的兼容入口。
+- 增加兼容层自动化测试，保证 V1 导出和命令名称不变。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
