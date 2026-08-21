@@ -7,7 +7,13 @@ import time
 
 from codex_sync import __version__
 from codex_sync.attachments import probe_attachments
-from codex_sync.cloud import AuthService, DeviceService, SupabaseClient, SupabaseDeviceRepository
+from codex_sync.cloud import (
+    AuthService,
+    DeviceService,
+    SupabaseClient,
+    SupabaseDeviceRepository,
+    SupabaseManualUploadRepository,
+)
 from codex_sync.config import (
     SupabaseConfig,
     default_app_paths,
@@ -24,6 +30,7 @@ from codex_sync.local.repair_engine import (
     sync_to_current_provider,
 )
 from codex_sync.sync import SyncStateStore
+from codex_sync.sync.upload import ManualUploadEngine
 
 
 def to_json(payload: dict[str, object]) -> str:
@@ -68,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("device-info", help="Show this installation's persistent device identity")
     subparsers.add_parser("device-register", help="Register or refresh this device in Supabase")
     subparsers.add_parser("device-list", help="List devices for the current Codex Sync account")
+    subparsers.add_parser("cloud-backup", help="Upload local Thread metadata and changed Session JSONL files")
     return parser
 
 
@@ -121,6 +129,7 @@ def main() -> int:
             "device-info",
             "device-register",
             "device-list",
+            "cloud-backup",
         }:
             app_paths = default_app_paths()
             state = SyncStateStore(app_paths)
@@ -164,6 +173,17 @@ def main() -> int:
                     payload = {
                         "action": "device-list",
                         "devices": devices.list_devices(),
+                    }
+                elif args.command == "cloud-backup":
+                    summary = ManualUploadEngine(
+                        paths,
+                        auth,
+                        devices,
+                        SupabaseManualUploadRepository(client),
+                    ).upload()
+                    payload = {
+                        "action": "cloud-backup",
+                        "summary": summary.to_dict(),
                     }
                 else:
                     raise RuntimeError(f"Unsupported cloud command: {args.command}")

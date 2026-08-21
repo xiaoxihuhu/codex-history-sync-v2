@@ -44,6 +44,16 @@
 - 密码仅通过隐藏交互输入，Token 不进入公开输出，远端错误回显会自动脱敏。
 - 只读审计现有 `codex-sync` Supabase 原型，确认需要兼容 migration，未修改主项目。
 
+### Phase 6
+
+- 增加 `cloud-backup`，以只读方式扫描本机 Thread 和对应 Session JSONL。
+- Thread 仅上传白名单元数据，Session 路径必须位于 `sessions/` 或 `archived_sessions/`。
+- Session 使用稳定文件读取、SHA256 内容寻址和云端 Hash 比较，只上传变化对象。
+- 兼容 Codex 数据库中使用 `\\?\` 前缀的 Windows 扩展长度 Session 路径。
+- 相同 SHA256 的 Session Storage 对象自动复用，避免重复上传。
+- 上传后重新读取云端 Session 清单并逐项验证 Hash，验证成功后才记录设备备份时间。
+- 增加本机增量行为、路径边界、PostgREST 冲突键和 Storage 二进制请求契约测试。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。

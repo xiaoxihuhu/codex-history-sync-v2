@@ -29,7 +29,7 @@
 - 本地历史文件已经被删除
 - 不同电脑之间迁移聊天记录
 
-V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计以及 Auth/Devices 客户端基础。
+V2 正在 `v2-development` 分阶段增加云端账号、设备、上传、恢复、附件和版本管理。当前已完成本地修复兼容层、附件探测、Supabase Schema/RLS 设计、Auth/Devices 客户端基础，以及 Thread / Session 手动增量上传。
 
 ## 运行环境
 
@@ -116,6 +116,16 @@ py -3 .\sync_backend.py --json device-list
 
 第一次运行会生成稳定的本机 `device_id`。云端注册和列表需要先完成 Supabase V2 兼容迁移与登录。
 
+### 手动上传 Thread 和 Session
+
+```powershell
+py -3 .\sync_backend.py --json cloud-backup
+```
+
+该命令只读扫描 Codex 状态数据库，通过白名单上传 Thread 元数据，并把 Session JSONL 按 SHA256 内容寻址保存到私有 Storage。未变化的 Session 不会重复上传；上传后会重新读取云端 Session 清单并逐项校验 Hash，验证成功后才更新设备的 `last_backup_at`。
+
+当前连接的 Supabase 原型 Schema 与仓库中的 V2 migrations 不兼容。必须先在干净项目部署 `migrations/001` 至 `009`，或完成经过审查的兼容迁移，才能实际执行该命令。详见 `docs/MANUAL-CLOUD-BACKUP.md`。
+
 ### 从最新备份恢复
 
 ```powershell
@@ -161,6 +171,7 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `migrations/`：Supabase PostgreSQL、RLS 和 Storage 策略
 - `docs/SUPABASE-SCHEMA.md`：云端 Schema、所有权和上线验证说明
 - `docs/AUTH-AND-DEVICES.md`：账号、DPAPI Session 和设备系统
+- `docs/MANUAL-CLOUD-BACKUP.md`：Thread / Session 手动上传、增量判断和验证规则
 - `docs/SUPABASE-COMPATIBILITY-AUDIT.md`：现有 Supabase 原型 Schema 的只读兼容审计
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录

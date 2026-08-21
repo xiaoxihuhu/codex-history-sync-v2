@@ -53,7 +53,7 @@ class FakeTransport:
                 "method": method,
                 "url": url,
                 "headers": dict(headers),
-                "body": json.loads(body.decode("utf-8")) if body else None,
+                "body": decode_fake_body(body),
                 "timeout": timeout,
             }
         )
@@ -68,6 +68,15 @@ def json_response(status: int, payload: object) -> HttpResponse:
         body=json.dumps(payload).encode("utf-8"),
         headers={"content-type": "application/json"},
     )
+
+
+def decode_fake_body(body: bytes | None) -> object | None:
+    if body is None:
+        return None
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return body
 
 
 def make_paths(root: Path) -> AppPaths:
@@ -321,6 +330,16 @@ class AuthAndDeviceTests(unittest.TestCase):
                     ),
                     json_response(200, user_payload()),
                     json_response(200, [{"id": "device-cloud-id"}]),
+                    json_response(200, user_payload()),
+                    json_response(
+                        201,
+                        [
+                            {
+                                "id": "device-cloud-id",
+                                "last_backup_at": "2026-08-21T00:00:00+00:00",
+                            }
+                        ],
+                    ),
                 ]
             )
             client = SupabaseClient(
@@ -332,13 +351,17 @@ class AuthAndDeviceTests(unittest.TestCase):
 
             registered = devices.register_current_device()
             listed = devices.list_devices()
+            backed_up = devices.record_successful_backup()
 
             self.assertEqual(registered["id"], "device-cloud-id")
             self.assertEqual(listed, [{"id": "device-cloud-id"}])
+            self.assertEqual(backed_up["id"], "device-cloud-id")
             upsert_request = transport.requests[1]
             self.assertIn("on_conflict=user_id%2Cid", upsert_request["url"])
             self.assertEqual(upsert_request["body"]["user_id"], user_payload()["id"])
             self.assertEqual(upsert_request["body"]["client_version"], __version__)
+            self.assertIsNotNone(state.get_device().last_backup_at)
+            self.assertIsNotNone(transport.requests[5]["body"]["last_backup_at"])
 
 
 if __name__ == "__main__":

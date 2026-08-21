@@ -119,6 +119,41 @@ class SupabaseClient:
             raise error_from_response(response.status, decoded, sensitive_values)
         return decoded
 
+    def request_bytes(
+        self,
+        method: str,
+        path: str,
+        *,
+        content: bytes,
+        content_type: str,
+        access_token: str,
+        extra_headers: Mapping[str, str] | None = None,
+        expected_statuses: tuple[int, ...] = (200,),
+    ) -> Any:
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": content_type,
+            "apikey": self.config.public_key,
+            "Authorization": f"Bearer {access_token}",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        response = self.transport.request(
+            method,
+            f"{self.config.project_url}{path}",
+            headers,
+            content,
+            self.timeout_seconds,
+        )
+        decoded = decode_json(response.body)
+        if response.status not in expected_statuses:
+            raise error_from_response(
+                response.status,
+                decoded,
+                [self.config.public_key, access_token],
+            )
+        return decoded
+
 
 def decode_json(body: bytes) -> Any:
     if not body:

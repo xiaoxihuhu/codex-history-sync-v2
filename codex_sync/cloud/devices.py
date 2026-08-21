@@ -94,3 +94,10 @@ class DeviceService:
         if session is None:
             raise RuntimeError("Sign in to Codex Sync before listing devices")
         return self.repository.list(session.user.id, session.access_token)
+
+    def record_successful_backup(self) -> dict[str, Any]:
+        session = self.auth.restore_session()
+        if session is None:
+            raise RuntimeError("Sign in to Codex Sync before recording a backup")
+        device = self.state.mark_device_backed_up()
+        return self.repository.upsert(session.user.id, device, session.access_token)
