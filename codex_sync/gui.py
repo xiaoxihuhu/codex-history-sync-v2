@@ -3,23 +3,30 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
+
+
+_CLI_LOCK = threading.Lock()
 
 
 def execute_cli(arguments: list[str]) -> tuple[int, dict[str, Any]]:
     """Run the JSON CLI in-process so the same code works from source and EXE."""
     from codex_sync import cli
 
-    previous_argv = sys.argv
-    output = io.StringIO()
-    try:
-        sys.argv = ["codex-history-sync", "--json", *arguments]
-        with redirect_stdout(output):
-            exit_code = cli.main()
-    finally:
-        sys.argv = previous_argv
+    # cli.main() currently reads process-global argv and stdout; serialize calls
+    # so concurrent GUI workers cannot exchange arguments or JSON output.
+    with _CLI_LOCK:
+        previous_argv = sys.argv
+        output = io.StringIO()
+        try:
+            sys.argv = ["codex-history-sync", "--json", *arguments]
+            with redirect_stdout(output):
+                exit_code = cli.main()
+        finally:
+            sys.argv = previous_argv
     text = output.getvalue().strip()
     if not text:
         return exit_code, {"ok": False, "error": "CLI returned no output"}
@@ -257,6 +264,9 @@ def main() -> int:
             if code != 0 or not data.get("ok"):
                 error = str(data.get("error") or f"{action} failed")
                 self._append_log(f"{action}: {error}")
+                if action == "读取账号":
+                    self.account_label.setText("账号: Supabase 未配置")
+                    return
                 QMessageBox.critical(self, action, error)
                 return
             self._append_log(f"{action}: 完成")
