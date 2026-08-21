@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from sync_backend import get_status, make_backup, resolve_paths, restore_backup, sync_to_current_provider
+from codex_sync.local.repair_engine import session_index_backup_path
 
 
 def write_config(
@@ -296,6 +297,25 @@ class SyncBackendTests(unittest.TestCase):
                     ("old_provider", "gpt-old", 1),
                 ],
             )
+
+    def test_long_attachment_restore_backup_path_keeps_metadata_writable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = (
+                Path(temp_dir)
+                / ("codex-home-" + "x" * 80)
+            )
+            codex_home.mkdir(parents=True)
+            write_config(codex_home)
+            create_threads_db(codex_home, with_model=True)
+            (codex_home / "session_index.jsonl").write_text(
+                '{"id":"thread-001","thread_name":"fixture","updated_at":""}\n',
+                encoding="utf-8",
+            )
+
+            backup_path = make_backup(resolve_paths(str(codex_home)), "pre-attachment-restore")
+
+            self.assertTrue(backup_path.is_file())
+            self.assertTrue(session_index_backup_path(backup_path).is_file())
 
 
 if __name__ == "__main__":

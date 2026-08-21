@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -109,7 +110,8 @@ def replace_file_with_retry(source_path: Path, target_path: Path) -> None:
 
 
 def write_text_exact(path: Path, text: str) -> None:
-    temp_path = path.with_name(f".{path.name}.codex-sync-{time.time_ns()}.tmp")
+    path_token = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:16]
+    temp_path = path.with_name(f".codex-sync-{path_token}-{time.time_ns()}.tmp")
     try:
         with temp_path.open("w", encoding="utf-8", newline="") as handle:
             handle.write(text)
