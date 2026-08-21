@@ -127,6 +127,8 @@ Codex Desktop 不同版本可能把状态数据库放在以下任一位置：
 - `codex_sync/local/repair_engine.py`：本地历史检查、修复、备份和恢复引擎
 - `codex_sync/attachments/probe.py`：只读图片和附件结构探测
 - `docs/ATTACHMENT-PROBE.md`：真实格式调查结果和 Probe 边界
+- `migrations/`：Supabase PostgreSQL、RLS 和 Storage 策略
+- `docs/SUPABASE-SCHEMA.md`：云端 Schema、所有权和上线验证说明
 - `launch_ui.ps1`：Windows 图形界面
 - `CHANGELOG.md`：正式版本变更记录
 

@@ -26,6 +26,15 @@
 - 输出 Thread、Session、Message、MIME、大小、路径、Hash、引用位置和存在状态。
 - 增加匿名化现代 Session fixture，并覆盖缺失文件、归档扫描和路径白名单测试。
 
+### Phase 4
+
+- 增加 profiles、devices、workspaces、threads、sessions、attachments、sync events 和 snapshots migrations。
+- 使用复合所有权外键阻止跨用户实体关联。
+- 附件按 `(user_id, sha256)` 去重，并单独保存多条消息引用。
+- 为全部公开表启用 RLS，撤销 `anon` 权限并显式授权 `authenticated`。
+- 增加私有 Storage bucket 和用户路径隔离的上传、下载、覆盖、删除策略。
+- 增加 migration 安全契约测试和 Supabase 上线验证清单。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。
