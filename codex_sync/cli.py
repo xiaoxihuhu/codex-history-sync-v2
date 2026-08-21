@@ -34,6 +34,7 @@ from codex_sync.local.repair_engine import (
 )
 from codex_sync.sync import SyncStateStore
 from codex_sync.sync.download import ManualDownloadEngine
+from codex_sync.sync.download_attachments import AttachmentDownloadEngine
 from codex_sync.sync.upload import ManualUploadEngine
 from codex_sync.sync.upload_attachments import AttachmentUploadEngine
 
@@ -94,6 +95,10 @@ def build_parser() -> argparse.ArgumentParser:
         "cloud-upload-attachments",
         help="Upload local images and attachments by SHA256 after Thread/Session backup",
     )
+    subparsers.add_parser(
+        "cloud-restore-attachments",
+        help="Download attachments and rewrite restored Session paths",
+    )
     return parser
 
 
@@ -150,6 +155,7 @@ def main() -> int:
             "cloud-backup",
             "cloud-restore",
             "cloud-upload-attachments",
+            "cloud-restore-attachments",
         }:
             app_paths = default_app_paths()
             state = SyncStateStore(app_paths)
@@ -228,6 +234,17 @@ def main() -> int:
                     ).upload()
                     payload = {
                         "action": "cloud-upload-attachments",
+                        "summary": summary.to_dict(),
+                    }
+                elif args.command == "cloud-restore-attachments":
+                    summary = AttachmentDownloadEngine(
+                        paths,
+                        auth,
+                        devices,
+                        SupabaseAttachmentRepository(client),
+                    ).restore()
+                    payload = {
+                        "action": "cloud-restore-attachments",
                         "summary": summary.to_dict(),
                     }
                 else:

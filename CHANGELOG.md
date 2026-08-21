@@ -75,6 +75,16 @@
 - 上传后验证云端 Hash 实体和引用位置，成功后才更新设备备份时间。
 - 增加 PNG、TXT、PDF、重复 Hash、二次增量和 Supabase Storage 请求契约测试。
 
+### Phase 9
+
+- 增加 `cloud-restore-attachments`，下载并验证云端图片和附件。
+- 使用 `.codex/restored_attachments/HASH_PREFIX/SHA256.ext` 重建目标机路径。
+- 按结构解析 Session JSONL，只替换 Probe 记录过的旧绝对路径和文件 URI。
+- 保留内嵌 `data:` 图片，并将匹配的本地图片引用指向恢复文件。
+- 支持重复恢复幂等，已存在且 Hash 正确的附件不会重复下载。
+- Session 写入失败时恢复原始字节并删除本轮新附件，回滚动作逐项执行。
+- 增加图片、TXT、PDF、不同电脑路径、引用修复和故障回滚测试。
+
 ## [1.0.0] - 2026-08-11
 
 首个正式稳定版本。

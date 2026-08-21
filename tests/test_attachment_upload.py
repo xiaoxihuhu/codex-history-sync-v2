@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from typing import Mapping
+from unittest.mock import patch
 
 from codex_sync.attachments.probe import probe_attachments
 from codex_sync.cloud.attachments import SupabaseAttachmentRepository
@@ -15,6 +19,7 @@ from codex_sync.hashing import sha256_bytes
 from codex_sync.local.repair_engine import resolve_paths
 from codex_sync.models import AuthSession, DeviceIdentity
 from codex_sync.sync.upload_attachments import AttachmentUploadEngine
+from codex_sync.sync.download_attachments import AttachmentDownloadEngine
 
 THREAD_ID = "thread-attachment-001"
 SESSION_ID = "session-attachment-001"
@@ -70,6 +75,7 @@ class MemoryAttachmentRepository:
                     "id": "cloud-session",
                     "thread_id": "cloud-thread",
                     "codex_session_id": SESSION_ID,
+                    "relative_path": "sessions/2026/08/21/rollout-attachment-fixture.jsonl",
                 }
             ]
             if include_cloud_history
@@ -95,6 +101,9 @@ class MemoryAttachmentRepository:
     def upload_object(self, object_path, content, mime_type, access_token):
         self.upload_calls += 1
         self.objects[object_path] = content
+
+    def download_object(self, object_path, access_token):
+        return self.objects[object_path]
 
     def upsert_attachments(self, user_id, device_id, rows, access_token):
         mapping = {}
@@ -165,7 +174,7 @@ def json_response(status: int, payload: object) -> HttpResponse:
 
 def create_attachment_home(root: Path) -> Path:
     codex_home = root / ".codex"
-    codex_home.mkdir()
+    codex_home.mkdir(parents=True)
     attachments_dir = codex_home / "attachments"
     text_path = attachments_dir / "text-id" / "pasted-text.txt"
     text_path.parent.mkdir(parents=True)
@@ -230,6 +239,26 @@ def create_attachment_home(root: Path) -> Path:
     return codex_home
 
 
+def create_attachment_restore_target(root: Path, source_home: Path) -> Path:
+    target = root / "TestComputerB" / ".codex"
+    target.mkdir(parents=True)
+    (target / "config.toml").write_text('model_provider = "openai"\n', encoding="utf-8")
+    with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+        conn.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)"
+        )
+        conn.commit()
+    source_session = (
+        source_home / "sessions" / "2026" / "08" / "21" / "rollout-attachment-fixture.jsonl"
+    )
+    target_session = (
+        target / "sessions" / "2026" / "08" / "21" / "rollout-attachment-fixture.jsonl"
+    )
+    target_session.parent.mkdir(parents=True)
+    shutil.copyfile(source_session, target_session)
+    return target
+
+
 class AttachmentUploadTests(unittest.TestCase):
     def test_deduplicates_embedded_image_and_uploads_text_pdf_and_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -287,6 +316,104 @@ class AttachmentUploadTests(unittest.TestCase):
 
             self.assertEqual(repository.upload_calls, 0)
             self.assertEqual(repository.objects, {})
+
+    def test_downloads_attachments_and_rewrites_old_computer_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_attachment_home(root / "TestComputerA")
+            repository = MemoryAttachmentRepository()
+            AttachmentUploadEngine(
+                resolve_paths(str(source)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).upload()
+            target = create_attachment_restore_target(root, source)
+
+            summary = AttachmentDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore()
+
+            self.assertEqual(summary.downloaded_objects, 3)
+            self.assertEqual(summary.local_restore.created_files, 3)
+            self.assertEqual(summary.local_restore.verified_files, 3)
+            self.assertEqual(summary.local_restore.rewritten_sessions, 1)
+            self.assertGreaterEqual(summary.local_restore.rewritten_references, 3)
+            restored_probe = probe_attachments(target)
+            local_records = [
+                item for item in restored_probe.attachments if item.local_path
+            ]
+            self.assertGreaterEqual(len(local_records), 3)
+            self.assertTrue(
+                all(str(target / "restored_attachments") in item.local_path for item in local_records)
+            )
+            self.assertTrue(all(item.exists for item in local_records))
+            self.assertEqual(
+                {item.sha256 for item in restored_probe.attachments if item.sha256},
+                set(repository.attachments),
+            )
+            second = AttachmentDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore()
+            self.assertEqual(second.downloaded_objects, 0)
+            self.assertEqual(second.local_restore.created_files, 0)
+            self.assertEqual(second.local_restore.rewritten_sessions, 0)
+            self.assertIsNone(second.local_restore.safety_backup)
+
+    def test_attachment_session_write_failure_rolls_back_created_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_attachment_home(root / "TestComputerA")
+            repository = MemoryAttachmentRepository()
+            AttachmentUploadEngine(
+                resolve_paths(str(source)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).upload()
+            target = create_attachment_restore_target(root, source)
+            session_path = (
+                target / "sessions" / "2026" / "08" / "21"
+                / "rollout-attachment-fixture.jsonl"
+            )
+            original_session = session_path.read_bytes()
+            from codex_sync.local import attachment_restore
+
+            real_atomic_write = attachment_restore.atomic_write_bytes
+            failure_injected = False
+
+            def fail_session_write(path, content):
+                nonlocal failure_injected
+                if path == session_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected Session write failure")
+                return real_atomic_write(path, content)
+
+            with patch(
+                "codex_sync.local.attachment_restore.atomic_write_bytes",
+                side_effect=fail_session_write,
+            ):
+                with self.assertRaisesRegex(OSError, "injected"):
+                    AttachmentDownloadEngine(
+                        resolve_paths(str(target)),
+                        FakeAuth(),
+                        FakeDevices(),
+                        repository,
+                    ).restore()
+
+            self.assertEqual(session_path.read_bytes(), original_session)
+            restored_files = list((target / "restored_attachments").rglob("*"))
+            self.assertFalse(any(path.is_file() for path in restored_files))
+            self.assertEqual(
+                len(list((target / "history_sync_backups").glob("*.bak"))),
+                1,
+            )
 
 
 class SupabaseAttachmentRepositoryTests(unittest.TestCase):

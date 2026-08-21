@@ -24,6 +24,8 @@ class AttachmentRepository(Protocol):
         access_token: str,
     ) -> None: ...
 
+    def download_object(self, object_path: str, access_token: str) -> bytes: ...
+
     def upsert_attachments(
         self,
         user_id: str,
@@ -63,7 +65,7 @@ class SupabaseAttachmentRepository:
     def list_sessions(self, user_id: str, access_token: str) -> list[dict[str, Any]]:
         return self._list(
             "sessions",
-            "id,thread_id,codex_session_id",
+            "id,thread_id,codex_session_id,relative_path",
             user_id,
             access_token,
         )
@@ -71,7 +73,10 @@ class SupabaseAttachmentRepository:
     def list_attachments(self, user_id: str, access_token: str) -> list[dict[str, Any]]:
         return self._list(
             "attachments",
-            "id,sha256,storage_path,file_size,mime_type",
+            (
+                "id,thread_id,session_id,sha256,file_name,file_extension,mime_type,"
+                "file_size,storage_path,original_local_path"
+            ),
             user_id,
             access_token,
         )
@@ -79,7 +84,10 @@ class SupabaseAttachmentRepository:
     def list_references(self, user_id: str, access_token: str) -> list[dict[str, Any]]:
         return self._list(
             "attachment_references",
-            "id,attachment_id,thread_id,session_id,message_id,reference_location",
+            (
+                "id,attachment_id,thread_id,session_id,message_id,reference_kind,"
+                "reference_location,original_local_path"
+            ),
             user_id,
             access_token,
         )
@@ -97,6 +105,9 @@ class SupabaseAttachmentRepository:
             content_type=mime_type or "application/octet-stream",
             access_token=access_token,
         )
+
+    def download_object(self, object_path: str, access_token: str) -> bytes:
+        return self.storage.download(object_path, access_token=access_token)
 
     def upsert_attachments(
         self,
