@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
 
 from codex_sync.hashing import sha256_bytes, sha256_file
+from codex_sync.local.catalog import session_id_from_payload
 
 WINDOWS_PATH_PATTERN = re.compile(
     r"(?P<path>(?:\\\\\?\\)?[A-Za-z]:[\\/](?![\\/])[^<>\"\r\n|]+?\.[A-Za-z0-9]{1,16})"
@@ -396,7 +397,7 @@ class AttachmentProbe:
 
                 if item.get("type") == "session_meta":
                     thread_id = string_or_none(payload.get("id")) or thread_id
-                    session_id = string_or_none(payload.get("session_id")) or thread_id
+                    session_id = session_id_from_payload(payload, thread_id or "")
                     continue
 
                 location = f"{relative_path}:{line_number}"

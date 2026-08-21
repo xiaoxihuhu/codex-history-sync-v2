@@ -351,6 +351,16 @@ class AttachmentUploadTests(unittest.TestCase):
                 all(str(target / "restored_attachments") in item.local_path for item in local_records)
             )
             self.assertTrue(all(item.exists for item in local_records))
+            restored_manifest = target / "attachments" / "pasted-text-attachments.json"
+            self.assertTrue(restored_manifest.is_file())
+            manifest = json.loads(restored_manifest.read_text(encoding="utf-8"))
+            self.assertEqual(len(manifest["attachmentPaths"]), 1)
+            self.assertTrue(
+                all(
+                    str(target / "restored_attachments") in value
+                    for value in manifest["attachmentPaths"]
+                )
+            )
             self.assertEqual(
                 {item.sha256 for item in restored_probe.attachments if item.sha256},
                 set(repository.attachments),

@@ -181,7 +181,11 @@ class MigrationContractTests(unittest.TestCase):
         self.assertIn("'users/' || user_id::text || '/sessions/' || content_hash || '.jsonl'", sessions)
         self.assertIn("sha256 ~ '^[0-9a-f]{64}$'", attachments)
         self.assertIn("unique (user_id, sha256)", attachments)
-        self.assertIn("'users/' || user_id::text || '/attachments/'", attachments)
+        self.assertIn("'users/' || user_id::text || '/attachments/%'", attachments)
+        self.assertNotIn(
+            "storage_path like 'users/' || user_id::text || '/attachments/'\n    and",
+            attachments,
+        )
         self.assertIn("'users/' || user_id::text || '/snapshots/%'", snapshots)
 
     def test_cross_user_relations_use_composite_foreign_keys(self) -> None:

@@ -140,6 +140,43 @@ class AttachmentProbeTests(unittest.TestCase):
             self.assertEqual(included.attachments[0].thread_id, "thread-archived-001")
             self.assertEqual(active_only.attachments, [])
 
+    def test_probe_uses_unique_rollout_id_for_continued_real_codex_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = Path(temp_dir)
+            session_dir = codex_home / "sessions" / "2026" / "08" / "21"
+            session_dir.mkdir(parents=True)
+            attachment = codex_home / "attachments" / "id" / "payload.txt"
+            attachment.parent.mkdir(parents=True)
+            attachment.write_text("fixture", encoding="utf-8")
+            items = [
+                {
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "rollout-continued-001",
+                        "session_id": "thread-parent-001",
+                        "parent_thread_id": "thread-parent-001",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": str(attachment)}],
+                    },
+                },
+            ]
+            (session_dir / "rollout-continued.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in items) + "\n",
+                encoding="utf-8",
+            )
+
+            result = probe_attachments(codex_home)
+
+            self.assertEqual(len(result.attachments), 1)
+            self.assertEqual(result.attachments[0].thread_id, "rollout-continued-001")
+            self.assertEqual(result.attachments[0].session_id, "rollout-continued-001")
+
     def test_extract_path_references_supports_file_uri_and_unknown_binary_extension(self) -> None:
         text = (
             "One C:\\Users\\Test\\.codex\\attachments\\id\\payload.custombin "

@@ -80,6 +80,18 @@ def relative_session_path(codex_home: Path, rollout_path: Path) -> str:
     return relative.as_posix()
 
 
+def session_id_from_payload(payload: dict[str, object], fallback_thread_id: str) -> str:
+    payload_id = str(payload.get("id") or "").strip()
+    payload_session_id = str(payload.get("session_id") or "").strip()
+    if payload_id and (
+        payload_id == payload_session_id
+        or payload.get("parent_thread_id")
+        or not payload_session_id
+    ):
+        return payload_id
+    return payload_session_id or payload_id or fallback_thread_id
+
+
 def read_session_id(path: Path, fallback_thread_id: str) -> str:
     with path.open("r", encoding="utf-8") as handle:
         first_line = handle.readline()
@@ -91,7 +103,7 @@ def read_session_id(path: Path, fallback_thread_id: str) -> str:
     payload = item.get("payload")
     if item.get("type") != "session_meta" or not isinstance(payload, dict):
         return fallback_thread_id
-    return str(payload.get("session_id") or payload.get("id") or fallback_thread_id)
+    return session_id_from_payload(payload, fallback_thread_id)
 
 
 def scan_local_catalog(paths: Paths) -> list[LocalThreadRecord]:

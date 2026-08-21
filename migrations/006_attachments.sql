@@ -26,7 +26,7 @@ create table public.attachments (
   foreign key (user_id, source_device_id)
     references public.devices (user_id, id) on delete restrict,
   check (
-    storage_path like 'users/' || user_id::text || '/attachments/'
+    storage_path like 'users/' || user_id::text || '/attachments/%'
     and storage_path like '%/' || sha256 || '%'
   )
 );

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,9 @@ def restore_attachments_locally(
     existing_files = 0
     replacements_by_session: dict[Path, dict[str, str]] = {}
     expected_reference_rewrites = 0
+    manifest_path = paths.codex_home / "attachments" / "pasted-text-attachments.json"
+    manifest_targets: list[str] = []
+    manifest_replacements: dict[str, str] = {}
 
     for item in prepared:
         target = restored_attachment_path(paths.codex_home, item.sha256, item.file_extension)
@@ -146,6 +150,13 @@ def restore_attachments_locally(
         for reference in item.references:
             session_id = str(reference.get("session_id") or "")
             original_path = str(reference.get("original_local_path") or "")
+            reference_kind = str(reference.get("reference_kind") or "")
+            if not session_id:
+                if reference_kind == "attachment_manifest" and original_path:
+                    manifest_targets.append(str(target))
+                    for variant in replacement_variants(original_path):
+                        manifest_replacements[variant] = str(target)
+                continue
             if not session_id or not original_path:
                 continue
             session_path = session_paths.get(session_id)
@@ -171,7 +182,42 @@ def restore_attachments_locally(
                     f"Attachment reference is missing from restored Session: {session_path}"
                 )
 
-    mutations = bool(files_to_create or replacements_by_session)
+    manifest_content: bytes | None = None
+    manifest_update = False
+    if manifest_targets:
+        if manifest_path.exists():
+            try:
+                manifest_payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"Attachment manifest is invalid: {manifest_path}") from exc
+            replaced_payload, _ = replace_json_strings(manifest_payload, manifest_replacements)
+            if not isinstance(replaced_payload, dict):
+                raise RuntimeError(f"Attachment manifest is not an object: {manifest_path}")
+            paths_value = replaced_payload.get("attachmentPaths")
+            if not isinstance(paths_value, list):
+                paths_value = []
+                replaced_payload["attachmentPaths"] = paths_value
+            current_counts = Counter(str(value) for value in paths_value if isinstance(value, str))
+            expected_counts = Counter(manifest_targets)
+            for target_path, expected_count in expected_counts.items():
+                for _ in range(max(0, expected_count - current_counts[target_path])):
+                    paths_value.append(target_path)
+            manifest_content = (
+                json.dumps(replaced_payload, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+            )
+            manifest_update = manifest_content != manifest_path.read_bytes()
+        else:
+            manifest_content = (
+                json.dumps(
+                    {"attachmentPaths": manifest_targets},
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8")
+                + b"\n"
+            )
+            manifest_update = True
+
+    mutations = bool(files_to_create or replacements_by_session or manifest_update)
     if not mutations:
         return AttachmentRestoreSummary(
             attachments=len(prepared),
@@ -188,6 +234,7 @@ def restore_attachments_locally(
         path: path.read_bytes()
         for path in replacements_by_session
     }
+    original_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
     rewritten_sessions = 0
     rewritten_references = 0
     created_files: list[Path] = []
@@ -202,6 +249,9 @@ def restore_attachments_locally(
             atomic_write_bytes(path, rewritten)
             rewritten_sessions += 1
             rewritten_references += count
+
+        if manifest_update and manifest_content is not None:
+            atomic_write_bytes(manifest_path, manifest_content)
 
         if rewritten_references < expected_reference_rewrites:
             raise RuntimeError("Not every Attachment path reference was rewritten")
@@ -221,6 +271,14 @@ def restore_attachments_locally(
                 path.unlink(missing_ok=True)
             except OSError as rollback_exc:
                 rollback_errors.append(f"{path}: {rollback_exc}")
+        if manifest_update:
+            try:
+                if original_manifest is None:
+                    manifest_path.unlink(missing_ok=True)
+                else:
+                    atomic_write_bytes(manifest_path, original_manifest)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"{manifest_path}: {rollback_exc}")
         if rollback_errors:
             raise RuntimeError(
                 "Attachment restore failed and rollback was incomplete: "
