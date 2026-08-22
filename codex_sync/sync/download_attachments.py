@@ -8,7 +8,7 @@ from pathlib import Path
 from codex_sync.cloud.attachments import AttachmentRepository
 from codex_sync.cloud.auth import AuthService
 from codex_sync.cloud.devices import DeviceService
-from codex_sync.hashing import sha256_bytes
+from codex_sync.hashing import sha256_file
 from codex_sync.local.attachment_restore import (
     AttachmentRestoreSummary,
     PreparedAttachmentRestore,
@@ -74,7 +74,11 @@ class AttachmentDownloadEngine:
                 if not attachment_id or not SHA256_PATTERN.fullmatch(digest):
                     raise RuntimeError("Cloud Attachment manifest contains an invalid entity")
                 expected_prefix = f"users/{session.user.id}/attachments/"
-                if not storage_path.startswith(expected_prefix) or digest not in storage_path:
+                expected_manifest = (
+                    f"users/{session.user.id}/large-objects/{digest}/manifest.json"
+                )
+                is_legacy = storage_path.startswith(expected_prefix) and digest in storage_path
+                if not is_legacy and storage_path != expected_manifest:
                     raise RuntimeError(f"Cloud Attachment has an unsafe Storage path: {digest}")
                 try:
                     file_size = int(item.get("file_size"))
@@ -82,19 +86,36 @@ class AttachmentDownloadEngine:
                     raise RuntimeError(f"Cloud Attachment has invalid file_size: {digest}") from exc
 
                 target = restored_attachment_path(self.paths.codex_home, digest, extension)
-                content: bytes | None = None
+                content_path: Path | None = None
                 if target.exists():
-                    if sha256_bytes(target.read_bytes()) != digest:
+                    if sha256_file(target) != digest:
                         raise RuntimeError(f"Existing restored Attachment hash mismatch: {digest}")
                     reused += 1
                 else:
-                    content = self.repository.download_object(storage_path, session.access_token)
-                    if len(content) != file_size or sha256_bytes(content) != digest:
+                    content_path = staging / digest
+                    download_to_path = getattr(
+                        self.repository,
+                        "download_object_to_path",
+                        None,
+                    )
+                    if callable(download_to_path):
+                        download_to_path(
+                            session.user.id,
+                            storage_path,
+                            content_path,
+                            digest,
+                            file_size,
+                            session.access_token,
+                        )
+                    else:
+                        content_path.write_bytes(
+                            self.repository.download_object(
+                                storage_path,
+                                session.access_token,
+                            )
+                        )
+                    if content_path.stat().st_size != file_size or sha256_file(content_path) != digest:
                         raise RuntimeError(f"Downloaded Attachment verification failed: {digest}")
-                    staged = staging / digest
-                    staged.write_bytes(content)
-                    if sha256_bytes(staged.read_bytes()) != digest:
-                        raise RuntimeError(f"Staged Attachment verification failed: {digest}")
                     downloaded += 1
                 prepared.append(
                     PreparedAttachmentRestore(
@@ -102,8 +123,9 @@ class AttachmentDownloadEngine:
                         sha256=digest,
                         file_extension=extension,
                         file_size=file_size,
-                        content=content,
+                        content=None,
                         references=tuple(references_by_attachment.get(attachment_id, [])),
+                        content_path=content_path,
                     )
                 )
 

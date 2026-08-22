@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from codex_sync.atomic_io import atomic_write_bytes
-from codex_sync.hashing import sha256_bytes
+from codex_sync.atomic_io import atomic_copy_file, atomic_write_bytes, atomic_write_stream
+from codex_sync.hashing import sha256_file
 from codex_sync.local.repair_engine import Paths, make_backup
 from codex_sync.local.restore_engine import safe_restore_path
 
@@ -23,6 +24,7 @@ class PreparedAttachmentRestore:
     file_size: int
     content: bytes | None
     references: tuple[dict[str, Any], ...]
+    content_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,49 @@ def rewrite_session_jsonl(content: bytes, replacements: dict[str, str]) -> tuple
     return "".join(output).encode("utf-8"), total
 
 
+def rewrite_session_line(line: bytes, replacements: dict[str, str]) -> tuple[bytes, int]:
+    body = line.rstrip(b"\r\n")
+    ending = line[len(body) :]
+    if not body:
+        return line, 0
+    try:
+        item = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Session JSONL contains invalid UTF-8 JSON") from exc
+    replaced, changed = replace_json_strings(item, replacements)
+    if not changed:
+        return line, 0
+    return (
+        json.dumps(replaced, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + ending,
+        changed,
+    )
+
+
+def count_session_references(path: Path, replacements: dict[str, str]) -> int:
+    total = 0
+    with path.open("rb") as handle:
+        for line in handle:
+            _, changed = rewrite_session_line(line, replacements)
+            total += changed
+    return total
+
+
+def atomic_rewrite_session_jsonl(path: Path, replacements: dict[str, str]) -> int:
+    total = 0
+
+    def write(output: Any) -> None:
+        nonlocal total
+        with path.open("rb") as input_handle:
+            for line in input_handle:
+                rewritten, changed = rewrite_session_line(line, replacements)
+                output.write(rewritten)
+                total += changed
+
+    atomic_write_stream(path, write)
+    return total
+
+
 def restore_attachments_locally(
     paths: Paths,
     prepared: list[PreparedAttachmentRestore],
@@ -127,7 +172,7 @@ def restore_attachments_locally(
         if item.get("id") and item.get("relative_path")
     }
     targets: dict[str, Path] = {}
-    files_to_create: list[tuple[Path, bytes]] = []
+    files_to_create: list[tuple[Path, bytes | None, Path | None]] = []
     existing_files = 0
     replacements_by_session: dict[Path, dict[str, str]] = {}
     expected_reference_rewrites = 0
@@ -139,13 +184,13 @@ def restore_attachments_locally(
         target = restored_attachment_path(paths.codex_home, item.sha256, item.file_extension)
         targets[item.attachment_id] = target
         if target.exists():
-            if sha256_bytes(target.read_bytes()) != item.sha256:
+            if sha256_file(target) != item.sha256:
                 raise RuntimeError(f"Existing restored Attachment hash mismatch: {target}")
             existing_files += 1
         else:
-            if item.content is None:
+            if item.content is None and item.content_path is None:
                 raise RuntimeError(f"Missing downloaded Attachment content: {item.sha256}")
-            files_to_create.append((target, item.content))
+            files_to_create.append((target, item.content, item.content_path))
 
         for reference in item.references:
             session_id = str(reference.get("session_id") or "")
@@ -162,14 +207,13 @@ def restore_attachments_locally(
             session_path = session_paths.get(session_id)
             if session_path is None or not session_path.is_file():
                 raise RuntimeError(f"Attachment Session is not restored locally: {session_id}")
-            session_content = session_path.read_bytes()
             variants = replacement_variants(original_path)
-            _, old_count = rewrite_session_jsonl(
-                session_content,
+            old_count = count_session_references(
+                session_path,
                 {variant: variant for variant in variants},
             )
-            _, restored_count = rewrite_session_jsonl(
-                session_content,
+            restored_count = count_session_references(
+                session_path,
                 {str(target): str(target)},
             )
             if old_count:
@@ -230,61 +274,66 @@ def restore_attachments_locally(
         )
 
     safety_backup = make_backup(paths, "pre-attachment-restore")
-    original_sessions = {
-        path: path.read_bytes()
-        for path in replacements_by_session
-    }
     original_manifest = manifest_path.read_bytes() if manifest_path.exists() else None
     rewritten_sessions = 0
     rewritten_references = 0
     created_files: list[Path] = []
-    try:
-        for target, content in files_to_create:
-            atomic_write_bytes(target, content)
-            created_files.append(target)
-        for path, replacements in replacements_by_session.items():
-            rewritten, count = rewrite_session_jsonl(original_sessions[path], replacements)
-            if count == 0:
-                raise RuntimeError(f"Attachment reference was not found in Session: {path}")
-            atomic_write_bytes(path, rewritten)
-            rewritten_sessions += 1
-            rewritten_references += count
-
-        if manifest_update and manifest_content is not None:
-            atomic_write_bytes(manifest_path, manifest_content)
-
-        if rewritten_references < expected_reference_rewrites:
-            raise RuntimeError("Not every Attachment path reference was rewritten")
-        for item in prepared:
-            target = targets[item.attachment_id]
-            if not target.is_file() or sha256_bytes(target.read_bytes()) != item.sha256:
-                raise RuntimeError(f"Attachment restore verification failed: {item.sha256}")
-    except Exception as exc:
-        rollback_errors: list[str] = []
-        for path, content in original_sessions.items():
-            try:
-                atomic_write_bytes(path, content)
-            except Exception as rollback_exc:
-                rollback_errors.append(f"{path}: {rollback_exc}")
-        for path in created_files:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError as rollback_exc:
-                rollback_errors.append(f"{path}: {rollback_exc}")
-        if manifest_update:
-            try:
-                if original_manifest is None:
-                    manifest_path.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(prefix="codex-sync-attachment-rollback-") as rollback_dir:
+        rollback_root = Path(rollback_dir)
+        original_sessions: dict[Path, Path] = {}
+        for index, path in enumerate(replacements_by_session):
+            backup_path = rollback_root / f"session-{index:06d}.jsonl"
+            atomic_copy_file(path, backup_path)
+            original_sessions[path] = backup_path
+        try:
+            for target, content, content_path in files_to_create:
+                if content_path is not None:
+                    atomic_copy_file(content_path, target)
                 else:
-                    atomic_write_bytes(manifest_path, original_manifest)
-            except OSError as rollback_exc:
-                rollback_errors.append(f"{manifest_path}: {rollback_exc}")
-        if rollback_errors:
-            raise RuntimeError(
-                "Attachment restore failed and rollback was incomplete: "
-                + "; ".join(rollback_errors)
-            ) from exc
-        raise
+                    atomic_write_bytes(target, content or b"")
+                created_files.append(target)
+            for path, replacements in replacements_by_session.items():
+                count = atomic_rewrite_session_jsonl(path, replacements)
+                if count == 0:
+                    raise RuntimeError(f"Attachment reference was not found in Session: {path}")
+                rewritten_sessions += 1
+                rewritten_references += count
+
+            if manifest_update and manifest_content is not None:
+                atomic_write_bytes(manifest_path, manifest_content)
+
+            if rewritten_references < expected_reference_rewrites:
+                raise RuntimeError("Not every Attachment path reference was rewritten")
+            for item in prepared:
+                target = targets[item.attachment_id]
+                if not target.is_file() or sha256_file(target) != item.sha256:
+                    raise RuntimeError(f"Attachment restore verification failed: {item.sha256}")
+        except Exception as exc:
+            rollback_errors: list[str] = []
+            for path, backup_path in original_sessions.items():
+                try:
+                    atomic_copy_file(backup_path, path)
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{path}: {rollback_exc}")
+            for path in created_files:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{path}: {rollback_exc}")
+            if manifest_update:
+                try:
+                    if original_manifest is None:
+                        manifest_path.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(manifest_path, original_manifest)
+                except OSError as rollback_exc:
+                    rollback_errors.append(f"{manifest_path}: {rollback_exc}")
+            if rollback_errors:
+                raise RuntimeError(
+                    "Attachment restore failed and rollback was incomplete: "
+                    + "; ".join(rollback_errors)
+                ) from exc
+            raise
 
     return AttachmentRestoreSummary(
         attachments=len(prepared),

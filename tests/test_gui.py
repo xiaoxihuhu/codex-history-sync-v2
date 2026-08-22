@@ -13,10 +13,12 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QProcess, QTimer
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from codex_sync.config import default_app_paths, load_supabase_config
 from codex_sync.gui import HistorySyncWindow, execute_cli
+from launch_gui import _internal_command_name
 
 
 class GuiTests(unittest.TestCase):
@@ -293,6 +295,62 @@ class GuiTests(unittest.TestCase):
         commands = [call["arguments"][0] for call in calls]
         self.assertEqual(commands, ["backup", "cloud-backup", "cloud-restore"])
         self.assertNotIn("cloud-upload-attachments", commands)
+
+    def test_default_gui_runs_internal_cli_in_qprocess_without_blocking_events(self) -> None:
+        window = HistorySyncWindow(auto_refresh=False)
+        self.windows.append(window)
+        completed: list[tuple[int, object]] = []
+        heartbeats = 0
+        timer = QTimer()
+        timer.setInterval(5)
+
+        def heartbeat() -> None:
+            nonlocal heartbeats
+            heartbeats += 1
+
+        timer.timeout.connect(heartbeat)
+        timer.start()
+        started_at = time.perf_counter()
+        started = window._task_controller.start(
+            "云端备份",
+            ["device-info"],
+            lambda code, payload: completed.append((code, payload)),
+            button=window.cloud_backup_button,
+        )
+        feedback_ms = (time.perf_counter() - started_at) * 1000
+
+        self.assertTrue(started)
+        self.assertIsInstance(window._task_controller.process, QProcess)
+        self.assertEqual(window.cloud_backup_button.text(), "云端备份中...")
+        self.assertFalse(window.cloud_backup_button.isEnabled())
+        self.assertLess(feedback_ms, 100)
+
+        deadline = time.monotonic() + 10
+        while window._task_controller.running and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        self.app.processEvents()
+        timer.stop()
+
+        self.assertFalse(window._task_controller.running)
+        self.assertTrue(completed)
+        self.assertEqual(completed[0][0], 0)
+        self.assertTrue(completed[0][1]["ok"])
+        self.assertGreater(heartbeats, 0)
+        self.assertEqual(window.cloud_backup_button.text(), "云端备份")
+        self.assertTrue(window.cloud_backup_button.isEnabled())
+        self.assertFalse(hasattr(window, "_threads"))
+
+    def test_internal_cli_progress_finds_command_after_global_option_value(self) -> None:
+        from codex_sync import cli
+
+        self.assertEqual(
+            _internal_command_name(
+                cli,
+                ["--json", "--codex-home", "C:/isolated/home", "cloud-backup"],
+            ),
+            "cloud-backup",
+        )
 
     def test_execute_cli_serializes_process_global_argv_and_stdout(self) -> None:
         original_argv = list(sys.argv)

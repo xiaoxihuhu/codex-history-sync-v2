@@ -8,10 +8,12 @@ from pathlib import Path
 from codex_sync.attachments.probe import AttachmentProbeRecord, probe_attachments
 from codex_sync.cloud.attachments import AttachmentRepository
 from codex_sync.cloud.auth import AuthService
+from codex_sync.cloud.storage import StorageObjectSource
 from codex_sync.cloud.devices import DeviceService
 from codex_sync.hashing import sha256_bytes
 from codex_sync.local.catalog import read_stable_file
 from codex_sync.local.repair_engine import Paths
+from codex_sync.progress import emit_progress
 
 UTC = timezone.utc
 SAFE_EXTENSION_PATTERN = re.compile(r"^\.[a-z0-9]{1,16}$")
@@ -42,19 +44,30 @@ def storage_extension(record: AttachmentProbeRecord) -> str:
     return ".bin"
 
 
-def attachment_content(records: list[AttachmentProbeRecord], expected_hash: str) -> bytes:
+def attachment_source(
+    records: list[AttachmentProbeRecord],
+    expected_hash: str,
+) -> StorageObjectSource:
     for record in records:
         if record.embedded_content is not None:
             content = record.embedded_content
             if sha256_bytes(content) != expected_hash:
                 raise RuntimeError(f"Embedded Attachment changed during scan: {record.reference_location}")
-            return content
+            return StorageObjectSource.from_bytes(
+                content,
+                expected_hash,
+                display_path=record.local_path or record.file_name,
+            )
     for record in records:
         if record.local_path and record.exists:
-            stable = read_stable_file(Path(record.local_path))
+            stable = read_stable_file(Path(record.local_path), load_content=False)
             if stable.sha256 != expected_hash:
                 raise RuntimeError(f"Attachment changed during scan: {record.local_path}")
-            return stable.content
+            return StorageObjectSource.from_path(
+                stable.path,
+                stable.sha256,
+                stable.file_size,
+            )
     raise RuntimeError(f"No readable content exists for Attachment {expected_hash}")
 
 
@@ -90,6 +103,11 @@ class AttachmentUploadEngine:
         device = self.devices.current_device()
         self.devices.register_current_device()
         result = probe_attachments(self.paths.codex_home, include_archived=True)
+        emit_progress(
+            "scan",
+            object_kind="Attachment",
+            attachments=len(result.attachments),
+        )
         eligible = [
             item
             for item in result.attachments
@@ -153,10 +171,11 @@ class AttachmentUploadEngine:
                 object_path = str(existing[digest].get("storage_path") or object_path)
                 reused_objects += 1
             else:
-                content = attachment_content(records, digest)
-                self.repository.upload_object(
+                source = attachment_source(records, digest)
+                object_path = self.repository.upload_source(
+                    session.user.id,
                     object_path,
-                    content,
+                    source,
                     representative.mime_type,
                     session.access_token,
                 )

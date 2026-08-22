@@ -116,7 +116,11 @@ class MemoryCloudRepository:
 
     def upload_session_object(self, user_id, stable_file, access_token):
         storage_path = f"users/{user_id}/sessions/{stable_file.sha256}.jsonl"
-        self.objects[storage_path] = stable_file.content
+        self.objects[storage_path] = (
+            stable_file.content
+            if stable_file.content is not None
+            else stable_file.path.read_bytes()
+        )
         return storage_path
 
     def upsert_sessions(self, user_id, device_id, rows, access_token):

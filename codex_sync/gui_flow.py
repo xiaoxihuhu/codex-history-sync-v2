@@ -81,6 +81,14 @@ def human_error(error: object) -> str:
         return "还有项目目录未映射，请先选择新电脑上的保存目录。"
     if "invalid login credentials" in lowered:
         return "登录失败，请检查邮箱和密码。"
+    if "quota" in lowered and (
+        "exceeded" in lowered or "insufficient" in lowered or "storage" in lowered
+    ):
+        return "云端总存储容量不足，请清理空间或升级 Supabase 配额。"
+    if "chunk=" in lowered or "downloaded chunk" in lowered:
+        return "大文件分片传输失败。可重新执行任务，已验证的分片会被复用。"
+    if "maximum allowed size" in lowered or "object too large" in lowered:
+        return "检测到大文件，但分片上传未能完成。请重新执行任务。"
     return text or "操作失败，请查看任务日志。"
 
 

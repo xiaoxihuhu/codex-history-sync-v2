@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import threading
+import time
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -19,12 +21,10 @@ from codex_sync.config import (
 )
 from codex_sync.gui_flow import (
     RECOVERY_STEPS,
-    GuiFlowError,
     build_bulk_mapping_targets,
     build_recovery_report,
     human_error,
     is_unconfigured_error,
-    run_full_restore,
     should_suggest_new_device,
 )
 
@@ -109,7 +109,7 @@ def execute_cli(
 
 
 try:
-    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, QTimer, Qt
     from PySide6.QtWidgets import (
         QAbstractItemView,
         QApplication,
@@ -124,6 +124,7 @@ try:
         QLineEdit,
         QMainWindow,
         QMessageBox,
+        QProgressBar,
         QPushButton,
         QTableWidget,
         QTableWidgetItem,
@@ -142,135 +143,269 @@ if PYSIDE6_AVAILABLE:
 
     Runner = Callable[..., tuple[int, dict[str, Any]]]
 
-    class CommandWorker(QObject):
-        finished = Signal(int, object)
-
+    class GuiTaskController(QObject):
         def __init__(
             self,
-            runner: Runner,
+            window: "HistorySyncWindow",
+            *,
+            status_label: QLabel,
+            elapsed_label: QLabel,
+            progress_bar: QProgressBar,
+        ) -> None:
+            super().__init__(window)
+            self.window = window
+            self.status_label = status_label
+            self.elapsed_label = elapsed_label
+            self.progress_bar = progress_bar
+            self.task_id: str | None = None
+            self.task_name = ""
+            self.started_at = 0.0
+            self.process: QProcess | None = None
+            self.callback: Callable[[int, object], None] | None = None
+            self.button: QPushButton | None = None
+            self.button_text = ""
+            self.stdout_buffer = b""
+            self.stderr_buffer = b""
+            self.result_payload: dict[str, Any] | None = None
+            self.timeout_warned = False
+            self.timer = QTimer(self)
+            self.timer.setInterval(250)
+            self.timer.timeout.connect(self._update_elapsed)
+
+        @property
+        def running(self) -> bool:
+            return self.process is not None
+
+        def start(
+            self,
+            task_name: str,
             arguments: list[str],
+            callback: Callable[[int, object], None],
             *,
             secret_inputs: list[str] | None = None,
             environment: Mapping[str, str] | None = None,
-        ) -> None:
-            super().__init__()
-            self.runner = runner
-            self.arguments = arguments
-            self.secret_inputs = secret_inputs or []
-            self.environment = dict(environment or {})
-
-        def run(self) -> None:
-            try:
-                code, payload = self.runner(
-                    self.arguments,
-                    secret_inputs=self.secret_inputs,
-                    environment=self.environment,
+            button: QPushButton | None = None,
+        ) -> bool:
+            if self.running:
+                QMessageBox.information(
+                    self.window,
+                    "任务正在执行",
+                    f"{self.task_name}正在执行，请等待当前任务完成。",
                 )
-            except Exception as exc:
-                code, payload = 1, {"ok": False, "error": str(exc)}
-            finally:
-                self.secret_inputs.clear()
-            self.finished.emit(code, payload)
+                return False
 
+            self.task_id = str(uuid.uuid4())
+            self.task_name = task_name
+            self.started_at = time.monotonic()
+            self.callback = callback
+            self.button = button
+            self.button_text = button.text() if button is not None else ""
+            self.stdout_buffer = b""
+            self.stderr_buffer = b""
+            self.result_payload = None
+            self.timeout_warned = False
+            self.status_label.setText(f"当前任务: {task_name}")
+            self.elapsed_label.setText("已运行: 00:00:00")
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("正在执行")
+            self.progress_bar.setVisible(True)
+            if button is not None:
+                button.setText(f"{task_name}中...")
+                button.setEnabled(False)
 
-    class CommandSequenceWorker(QObject):
-        finished = Signal(int, object)
+            process = QProcess(self)
+            self.process = process
+            process.setProcessChannelMode(QProcess.ProcessChannelMode.SeparateChannels)
+            process.readyReadStandardOutput.connect(self._read_stdout)
+            process.readyReadStandardError.connect(self._read_stderr)
+            process.finished.connect(self._finished)
+            process.errorOccurred.connect(self._process_error)
 
-        def __init__(self, runner: Runner, commands: list[list[str]]) -> None:
-            super().__init__()
-            self.runner = runner
-            self.commands = commands
+            process_environment = QProcessEnvironment.systemEnvironment()
+            for key, value in dict(environment or {}).items():
+                process_environment.insert(str(key), str(value))
+            secrets = [str(value) for value in (secret_inputs or [])]
+            process_environment.insert(
+                "CODEX_SYNC_INTERNAL_SECRET_COUNT",
+                str(len(secrets)),
+            )
+            process.setProcessEnvironment(process_environment)
 
-        def run(self) -> None:
-            results: list[dict[str, Any]] = []
-            try:
-                for arguments in self.commands:
-                    code, payload = self.runner(arguments)
-                    data = payload if isinstance(payload, dict) else {}
-                    if code != 0 or not data.get("ok"):
-                        self.finished.emit(
-                            1,
-                            {
-                                "ok": False,
-                                "error": str(
-                                    data.get("error") or f"{arguments[0]} failed"
-                                ),
-                                "failed_command": arguments[0],
-                                "results": results,
-                            },
-                        )
-                        return
-                    results.append(data)
-            except Exception as exc:
-                self.finished.emit(1, {"ok": False, "error": str(exc)})
-                return
-            self.finished.emit(0, {"ok": True, "results": results})
-
-
-    class StartupWorker(QObject):
-        finished = Signal(object)
-
-        def __init__(self, runner: Runner) -> None:
-            super().__init__()
-            self.runner = runner
-
-        def run(self) -> None:
-            results: dict[str, tuple[int, dict[str, Any]]] = {}
-            try:
-                results["status"] = self.runner(["status"])
-                results["auth"] = self.runner(["auth-status"])
-                results["device_info"] = self.runner(["device-info"])
-
-                auth_code, auth_payload = results["auth"]
-                if (
-                    auth_code == 0
-                    and isinstance(auth_payload, dict)
-                    and auth_payload.get("ok")
-                    and auth_payload.get("signed_in")
-                ):
-                    for key, command in (
-                        ("device_register", ["device-register"]),
-                        ("devices", ["device-list"]),
-                        ("workspaces", ["workspace-list"]),
-                        ("snapshots", ["cloud-snapshot-list"]),
-                    ):
-                        results[key] = self.runner(command)
-            except Exception as exc:
-                results["worker_error"] = (1, {"ok": False, "error": str(exc)})
-            self.finished.emit(results)
-
-
-    class RecoveryWorker(QObject):
-        progress = Signal(str, str, str)
-        finished = Signal(int, object)
-
-        def __init__(self, runner: Runner) -> None:
-            super().__init__()
-            self.runner = runner
-
-        def run(self) -> None:
-            try:
-                result = run_full_restore(
-                    lambda arguments: self.runner(arguments),
-                    lambda step, status, detail: self.progress.emit(
-                        step,
-                        status,
-                        detail,
-                    ),
-                )
-            except GuiFlowError as exc:
-                self.finished.emit(
-                    1,
-                    {
-                        "ok": False,
-                        "error": str(exc),
-                        "destination": exc.destination,
-                    },
-                )
-            except Exception as exc:
-                self.finished.emit(1, {"ok": False, "error": str(exc)})
+            if getattr(sys, "frozen", False):
+                program = sys.executable
+                process_arguments = ["--internal-cli", "--json", *arguments]
             else:
-                self.finished.emit(0, {"ok": True, **result.to_dict()})
+                program = sys.executable
+                launcher = Path(__file__).resolve().parent.parent / "launch_gui.py"
+                process_arguments = [
+                    str(launcher),
+                    "--internal-cli",
+                    "--json",
+                    *arguments,
+                ]
+            process.setProgram(program)
+            process.setArguments(process_arguments)
+
+            def write_secrets() -> None:
+                if secrets:
+                    payload = json.dumps(
+                        {"secret_inputs": secrets},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8") + b"\n"
+                    process.write(payload)
+                    for index in range(len(secrets)):
+                        secrets[index] = ""
+                process.closeWriteChannel()
+
+            process.started.connect(write_secrets)
+            self.timer.start()
+            process.start()
+            return True
+
+        def cancel(self) -> None:
+            process = self.process
+            if process is None:
+                return
+            self.callback = None
+            process.terminate()
+            if not process.waitForFinished(3000):
+                process.kill()
+                process.waitForFinished(3000)
+
+        def _read_stdout(self) -> None:
+            process = self.process
+            if process is None:
+                return
+            self.stdout_buffer += bytes(process.readAllStandardOutput())
+            while b"\n" in self.stdout_buffer:
+                line, self.stdout_buffer = self.stdout_buffer.split(b"\n", 1)
+                self._consume_stdout_line(line)
+
+        def _read_stderr(self) -> None:
+            process = self.process
+            if process is not None:
+                self.stderr_buffer += bytes(process.readAllStandardError())
+
+        def _consume_stdout_line(self, line: bytes) -> None:
+            text = line.decode("utf-8", errors="replace").strip()
+            if not text:
+                return
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                self.window._append_log(f"{self.task_name}: {text}")
+                return
+            if not isinstance(payload, dict):
+                return
+            if payload.get("event"):
+                self._apply_progress(payload)
+            elif "ok" in payload:
+                self.result_payload = payload
+
+        def _apply_progress(self, payload: dict[str, Any]) -> None:
+            event = str(payload.get("event") or "")
+            if event == "chunked-switch":
+                self.status_label.setText(
+                    f"当前任务: {self.task_name} - 检测到大文件，正在切换分片上传"
+                )
+            elif event == "chunk-complete":
+                chunk = int(payload.get("chunk") or 0)
+                chunks = int(payload.get("chunks") or 0)
+                self.status_label.setText(
+                    f"当前任务: {self.task_name} - Chunk {chunk} / {chunks}"
+                )
+            total = int(payload.get("total") or 0)
+            completed = int(payload.get("bytes") or 0)
+            if total > 0:
+                self.progress_bar.setRange(0, 1000)
+                self.progress_bar.setValue(min(1000, int(completed * 1000 / total)))
+                self.progress_bar.setFormat(
+                    f"{self._format_bytes(completed)} / {self._format_bytes(total)}  "
+                    f"{completed * 100 / total:.1f}%"
+                )
+
+        def _update_elapsed(self) -> None:
+            if not self.running:
+                return
+            elapsed = max(0, int(time.monotonic() - self.started_at))
+            hours, remainder = divmod(elapsed, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            self.elapsed_label.setText(
+                f"已运行: {hours:02d}:{minutes:02d}:{seconds:02d}"
+            )
+            if elapsed >= 30 and not self.timeout_warned:
+                self.timeout_warned = True
+                self.window._append_log(
+                    f"{self.task_name}: 任务仍在运行，窗口可以继续操作。"
+                )
+
+        def _process_error(self, error: QProcess.ProcessError) -> None:
+            if error == QProcess.ProcessError.FailedToStart:
+                self.result_payload = {
+                    "ok": False,
+                    "error": "内部任务进程无法启动",
+                }
+                QTimer.singleShot(0, self._finish_failed_start)
+
+        def _finish_failed_start(self) -> None:
+            if self.process is None or self.process.state() != QProcess.ProcessState.NotRunning:
+                return
+            payload = self.result_payload or {
+                "ok": False,
+                "error": "内部任务进程无法启动",
+            }
+            callback = self.callback
+            self._reset()
+            if callback is not None:
+                callback(1, payload)
+
+        def _finished(
+            self,
+            exit_code: int,
+            _exit_status: QProcess.ExitStatus,
+        ) -> None:
+            self._read_stdout()
+            self._read_stderr()
+            if self.stdout_buffer.strip():
+                self._consume_stdout_line(self.stdout_buffer)
+            payload = self.result_payload
+            if payload is None:
+                stderr = self.stderr_buffer.decode("utf-8", errors="replace").strip()
+                payload = {
+                    "ok": False,
+                    "error": stderr or "内部任务没有返回结果",
+                }
+            callback = self.callback
+            self._reset()
+            if callback is not None:
+                callback(exit_code, payload)
+
+        def _reset(self) -> None:
+            process = self.process
+            self.timer.stop()
+            self.process = None
+            self.callback = None
+            self.task_id = None
+            self.status_label.setText("当前任务: 无")
+            self.elapsed_label.setText("已运行: 00:00:00")
+            self.progress_bar.setVisible(False)
+            if self.button is not None:
+                self.button.setText(self.button_text)
+                self.button.setEnabled(True)
+            self.button = None
+            self.button_text = ""
+            if process is not None:
+                process.deleteLater()
+
+        @staticmethod
+        def _format_bytes(value: int) -> str:
+            amount = float(value)
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if amount < 1024 or unit == "TB":
+                    return f"{amount:.1f} {unit}"
+                amount /= 1024
+            return f"{amount:.1f} TB"
 
 
     class HistorySyncWindow(QMainWindow):
@@ -284,8 +419,7 @@ if PYSIDE6_AVAILABLE:
             self.setWindowTitle("Codex History Sync")
             self.resize(1180, 820)
             self._runner = command_runner
-            self._threads: list[QThread] = []
-            self._workers: list[QObject] = []
+            self._use_process = command_runner is execute_cli
             self._workspace_rows: list[dict[str, Any]] = []
             self._snapshot_rows: list[dict[str, Any]] = []
             self._last_status: dict[str, Any] = {}
@@ -293,7 +427,16 @@ if PYSIDE6_AVAILABLE:
             self._last_devices: list[dict[str, Any]] = []
             self._cloud_configured = False
             self._signed_in = False
+            self._recovery_active = False
+            self._recovery_queue: list[tuple[str, str, list[str], str, str]] = []
+            self._recovery_data: dict[str, Any] = {}
             self._build_ui()
+            self._task_controller = GuiTaskController(
+                self,
+                status_label=self.task_status_label,
+                elapsed_label=self.task_elapsed_label,
+                progress_bar=self.task_progress,
+            )
             self._load_configuration()
             self._reset_recovery_steps()
             if auto_refresh:
@@ -304,6 +447,18 @@ if PYSIDE6_AVAILABLE:
             root_layout = QVBoxLayout(root)
             self.tabs = QTabWidget()
             root_layout.addWidget(self.tabs, 1)
+            task_row = QWidget()
+            task_layout = QHBoxLayout(task_row)
+            task_layout.setContentsMargins(0, 0, 0, 0)
+            self.task_status_label = QLabel("当前任务: 无")
+            self.task_elapsed_label = QLabel("已运行: 00:00:00")
+            self.task_progress = QProgressBar()
+            self.task_progress.setMinimumWidth(280)
+            self.task_progress.setVisible(False)
+            task_layout.addWidget(self.task_status_label)
+            task_layout.addWidget(self.task_elapsed_label)
+            task_layout.addWidget(self.task_progress, 1)
+            root_layout.addWidget(task_row)
             self.log = QTextEdit()
             self.log.setReadOnly(True)
             self.log.setPlaceholderText("任务日志")
@@ -545,24 +700,6 @@ if PYSIDE6_AVAILABLE:
             )
             return table
 
-        def _start_worker(
-            self,
-            worker: QObject,
-            finished_signal: Any,
-            callback: Callable[..., None],
-        ) -> None:
-            thread = QThread(self)
-            worker.moveToThread(thread)
-            thread.started.connect(worker.run)
-            finished_signal.connect(callback)
-            finished_signal.connect(thread.quit)
-            finished_signal.connect(worker.deleteLater)
-            thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(lambda: self._forget_worker(thread, worker))
-            self._threads.append(thread)
-            self._workers.append(worker)
-            thread.start()
-
         def _run(
             self,
             arguments: list[str],
@@ -570,28 +707,99 @@ if PYSIDE6_AVAILABLE:
             *,
             secret_inputs: list[str] | None = None,
             environment: Mapping[str, str] | None = None,
+            task_name: str | None = None,
+            button: QPushButton | None = None,
         ) -> None:
-            worker = CommandWorker(
-                self._runner,
-                arguments,
-                secret_inputs=secret_inputs,
-                environment=environment,
-            )
-            self._start_worker(worker, worker.finished, callback)
+            resolved_name, resolved_button = self._task_descriptor(arguments[0])
+            action = task_name or resolved_name
+            task_button = button or resolved_button
+            if self._use_process:
+                self._task_controller.start(
+                    action,
+                    arguments,
+                    callback,
+                    secret_inputs=secret_inputs,
+                    environment=environment,
+                    button=task_button,
+                )
+                return
+            try:
+                result = self._runner(
+                    arguments,
+                    secret_inputs=secret_inputs,
+                    environment=environment,
+                )
+            except Exception as exc:
+                result = (1, {"ok": False, "error": str(exc)})
+            callback(*result)
 
         def _run_sequence(
             self,
             commands: list[list[str]],
             callback: Callable[[int, object], None],
+            *,
+            continue_on_error: bool = False,
+            task_name: str = "批量任务",
+            button: QPushButton | None = None,
         ) -> None:
-            worker = CommandSequenceWorker(self._runner, commands)
-            self._start_worker(worker, worker.finished, callback)
+            results: list[dict[str, Any]] = []
 
-        def _forget_worker(self, thread: QThread, worker: QObject) -> None:
-            if thread in self._threads:
-                self._threads.remove(thread)
-            if worker in self._workers:
-                self._workers.remove(worker)
+            def run_at(index: int) -> None:
+                if index >= len(commands):
+                    callback(0, {"ok": True, "results": results})
+                    return
+
+                arguments = commands[index]
+
+                def finished(code: int, payload: object) -> None:
+                    data = payload if isinstance(payload, dict) else {}
+                    results.append(
+                        {
+                            "arguments": list(arguments),
+                            "code": code,
+                            "payload": data,
+                        }
+                    )
+                    if (code != 0 or not data.get("ok")) and not continue_on_error:
+                        callback(
+                            code or 1,
+                            {
+                                "ok": False,
+                                "error": str(
+                                    data.get("error") or f"{arguments[0]} failed"
+                                ),
+                                "failed_command": arguments[0],
+                                "results": results,
+                            },
+                        )
+                        return
+                    run_at(index + 1)
+
+                self._run(
+                    arguments,
+                    finished,
+                    task_name=task_name,
+                    button=button if index == 0 else None,
+                )
+
+            run_at(0)
+
+        def _task_descriptor(
+            self,
+            command: str,
+        ) -> tuple[str, QPushButton | None]:
+            mapping: dict[str, tuple[str, QPushButton | None]] = {
+                "status": ("刷新状态", self.refresh_button),
+                "sync": ("本地修复", self.repair_button),
+                "backup": ("本地备份", self.local_backup_button),
+                "cloud-backup": ("云端备份", self.cloud_backup_button),
+                "cloud-restore": ("云端恢复", self.cloud_restore_button),
+                "queue-status": ("刷新队列", self.queue_refresh_button),
+                "cloud-snapshot-list": ("刷新版本", self.snapshot_refresh_button),
+                "cloud-snapshot-create": ("创建版本", self.snapshot_create_button),
+                "cloud-snapshot-restore": ("恢复版本", self.snapshot_restore_button),
+            }
+            return mapping.get(command, (command, None))
 
         def _handle(
             self,
@@ -661,8 +869,67 @@ if PYSIDE6_AVAILABLE:
             self.tabs.setCurrentWidget(self.settings_tab)
 
         def refresh_overview(self) -> None:
-            worker = StartupWorker(self._runner)
-            self._start_worker(worker, worker.finished, self._apply_startup)
+            self._run_sequence(
+                [["status"], ["auth-status"], ["device-info"]],
+                self._startup_base_finished,
+                continue_on_error=True,
+                task_name="刷新状态",
+                button=self.refresh_button,
+            )
+
+        def _startup_base_finished(self, _code: int, payload: object) -> None:
+            data = payload if isinstance(payload, dict) else {}
+            rows = data.get("results") if isinstance(data.get("results"), list) else []
+            keys = ("status", "auth", "device_info")
+            results: dict[str, tuple[int, dict[str, Any]]] = {}
+            for key, row in zip(keys, rows):
+                if not isinstance(row, dict):
+                    continue
+                item = row.get("payload")
+                results[key] = (
+                    int(row.get("code") or 0),
+                    item if isinstance(item, dict) else {},
+                )
+            auth_code, auth_payload = results.get("auth", (1, {}))
+            if (
+                auth_code == 0
+                and auth_payload.get("ok")
+                and auth_payload.get("signed_in")
+            ):
+                self._run_sequence(
+                    [
+                        ["device-register"],
+                        ["device-list"],
+                        ["workspace-list"],
+                        ["cloud-snapshot-list"],
+                    ],
+                    lambda _extra_code, extra_payload: self._startup_cloud_finished(
+                        results,
+                        extra_payload,
+                    ),
+                    continue_on_error=True,
+                    task_name="读取云端状态",
+                )
+                return
+            self._apply_startup(results)
+
+        def _startup_cloud_finished(
+            self,
+            results: dict[str, tuple[int, dict[str, Any]]],
+            payload: object,
+        ) -> None:
+            data = payload if isinstance(payload, dict) else {}
+            rows = data.get("results") if isinstance(data.get("results"), list) else []
+            keys = ("device_register", "devices", "workspaces", "snapshots")
+            for key, row in zip(keys, rows):
+                if not isinstance(row, dict):
+                    continue
+                item = row.get("payload")
+                results[key] = (
+                    int(row.get("code") or 0),
+                    item if isinstance(item, dict) else {},
+                )
+            self._apply_startup(results)
 
         def _apply_startup(
             self,
@@ -1108,11 +1375,104 @@ if PYSIDE6_AVAILABLE:
             self._reset_recovery_steps()
             self.full_restore_button.setEnabled(False)
             self.recovery_start_button.setEnabled(False)
-            worker = RecoveryWorker(self._runner)
-            worker.progress.connect(self._set_recovery_progress)
-            self._start_worker(worker, worker.finished, self._recovery_finished)
+            self._recovery_active = True
+            self._recovery_data = {}
+            self._recovery_queue = [
+                ("prepare", "读取当前本机状态", ["status"], "本机状态已读取", "initial_status"),
+                ("auth", "检查 Codex Sync 登录状态", ["auth-status"], "账号已登录", "auth"),
+                ("workspace", "检查项目目录映射", ["workspace-list"], "Workspace 已检查", "workspaces"),
+                ("backup", "创建本机安全备份", ["backup"], "本机安全备份已创建", "backup"),
+                ("history", "恢复 Thread 和 Session", ["cloud-restore"], "Thread 和 Session 恢复完成", "history_restore"),
+                (
+                    "attachments",
+                    "恢复图片和附件",
+                    ["cloud-restore-attachments"],
+                    "图片和附件恢复完成",
+                    "attachment_restore",
+                ),
+                ("repair", "修复本地 Provider、Model 和索引", ["sync"], "本地修复完成", "local_repair"),
+                ("verify", "检查本机状态", ["status"], "本机状态已检查", "final_status"),
+                (
+                    "verify",
+                    "检查附件引用",
+                    ["probe-attachments"],
+                    "恢复结果检查完成",
+                    "attachment_probe",
+                ),
+            ]
+            self._continue_full_restore()
+
+        def _continue_full_restore(self) -> None:
+            if not self._recovery_queue:
+                self._set_recovery_progress("complete", "成功", "恢复完成")
+                self._recovery_finished(0, {"ok": True, **self._recovery_data})
+                return
+            step, detail, arguments, success_detail, result_key = self._recovery_queue.pop(0)
+            self._set_recovery_progress(step, "进行中", detail)
+
+            def finished(code: int, payload: object) -> None:
+                data = payload if isinstance(payload, dict) else {}
+                if code != 0 or not data.get("ok"):
+                    raw_error = str(data.get("error") or f"{arguments[0]} failed")
+                    self._set_recovery_progress(step, "失败", human_error(raw_error))
+                    destination = "settings" if step == "auth" else None
+                    self._recovery_finished(
+                        1,
+                        {
+                            "ok": False,
+                            "error": raw_error,
+                            "destination": destination,
+                        },
+                    )
+                    return
+                if step == "auth" and not data.get("signed_in"):
+                    message = "请先登录 Codex Sync 账号。"
+                    self._set_recovery_progress(step, "失败", message)
+                    self._recovery_finished(
+                        1,
+                        {"ok": False, "error": message, "destination": "settings"},
+                    )
+                    return
+                if step == "workspace":
+                    workspaces = [
+                        row
+                        for row in data.get("workspaces", [])
+                        if isinstance(row, dict)
+                    ]
+                    unmapped = [row for row in workspaces if not row.get("mapped")]
+                    if unmapped:
+                        message = "还有项目目录未映射，请先选择新电脑上的保存目录。"
+                        self._set_recovery_progress(
+                            step,
+                            "失败",
+                            f"{message} 未映射: {len(unmapped)}",
+                        )
+                        self._recovery_finished(
+                            1,
+                            {
+                                "ok": False,
+                                "error": message,
+                                "destination": "workspace",
+                            },
+                        )
+                        return
+                    self._recovery_data[result_key] = workspaces
+                    success = f"已映射 {len(workspaces)} 个 Workspace"
+                else:
+                    self._recovery_data[result_key] = data
+                    success = success_detail
+                self._set_recovery_progress(step, "成功", success)
+                self._continue_full_restore()
+
+            self._run(
+                arguments,
+                finished,
+                task_name="完整恢复",
+            )
 
         def _recovery_finished(self, code: int, payload: object) -> None:
+            self._recovery_active = False
+            self._recovery_queue = []
             self.full_restore_button.setEnabled(True)
             self.recovery_start_button.setEnabled(True)
             data = payload if isinstance(payload, dict) else {}
@@ -1131,6 +1491,31 @@ if PYSIDE6_AVAILABLE:
             self.recovery_result.setPlainText(report)
             QMessageBox.information(self, "完整恢复到本机", report)
             self.refresh_overview()
+
+        def closeEvent(self, event: Any) -> None:
+            if not self._task_controller.running and not self._recovery_active:
+                event.accept()
+                return
+            box = QMessageBox(self)
+            box.setWindowTitle("任务正在执行")
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setText(
+                f"{self._task_controller.task_name or '当前任务'}正在执行。\n\n"
+                "强制退出可能造成本次任务未完成。"
+            )
+            wait_button = box.addButton("继续等待", QMessageBox.ButtonRole.RejectRole)
+            cancel_button = box.addButton(
+                "取消任务并退出",
+                QMessageBox.ButtonRole.DestructiveRole,
+            )
+            box.exec()
+            if box.clickedButton() is cancel_button:
+                self._recovery_active = False
+                self._recovery_queue = []
+                self._task_controller.cancel()
+                event.accept()
+            else:
+                event.ignore()
 
         def refresh_queue(self) -> None:
             self._run(

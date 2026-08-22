@@ -9,12 +9,12 @@ from typing import Any
 from codex_sync.cloud.auth import AuthService
 from codex_sync.cloud.devices import DeviceService
 from codex_sync.cloud.restore import RestoreRepository
-from codex_sync.hashing import sha256_bytes
+from codex_sync.hashing import sha256_file
 from codex_sync.local.repair_engine import Paths, ensure_environment
 from codex_sync.local.restore_engine import (
     LocalRestoreSummary,
     PreparedTextRestore,
-    parse_session_meta,
+    parse_session_meta_file,
     restore_text_history,
     safe_restore_path,
 )
@@ -145,7 +145,7 @@ class ManualDownloadEngine:
         prepared: list[PreparedTextRestore] = []
         downloaded_objects = 0
         reused_local = 0
-        staged_by_hash: dict[str, bytes] = {}
+        staged_by_hash: dict[str, Path] = {}
 
         with tempfile.TemporaryDirectory(prefix="codex-sync-restore-") as temp_dir:
             staging_root = Path(temp_dir)
@@ -161,7 +161,10 @@ class ManualDownloadEngine:
                 expected_storage_path = (
                     f"users/{session.user.id}/sessions/{content_hash}.jsonl"
                 )
-                if storage_path != expected_storage_path:
+                expected_manifest_path = (
+                    f"users/{session.user.id}/large-objects/{content_hash}/manifest.json"
+                )
+                if storage_path not in {expected_storage_path, expected_manifest_path}:
                     raise RuntimeError(f"Cloud Session has an unsafe Storage path: {local_thread_id}")
                 try:
                     expected_size = int(cloud_session.get("file_size"))
@@ -171,33 +174,43 @@ class ManualDownloadEngine:
                     raise RuntimeError(f"Cloud Session has invalid file_size: {local_thread_id}")
 
                 target = safe_restore_path(self.paths.codex_home, relative_path)
-                content: bytes | None = None
+                content_path: Path | None = None
                 if target.exists():
                     reused_local += 1
                 else:
-                    content = staged_by_hash.get(content_hash)
-                    if content is None:
-                        content = self.repository.download_session(
-                            storage_path,
-                            session.access_token,
+                    content_path = staged_by_hash.get(content_hash)
+                    if content_path is None:
+                        content_path = staging_root / f"{content_hash}.jsonl"
+                        download_to_path = getattr(
+                            self.repository,
+                            "download_session_to_path",
+                            None,
                         )
-                        if len(content) != expected_size:
+                        if callable(download_to_path):
+                            download_to_path(
+                                session.user.id,
+                                storage_path,
+                                content_path,
+                                content_hash,
+                                expected_size,
+                                session.access_token,
+                            )
+                        else:
+                            content = self.repository.download_session(
+                                storage_path,
+                                session.access_token,
+                            )
+                            content_path.write_bytes(content)
+                        if content_path.stat().st_size != expected_size:
                             raise RuntimeError(
                                 f"Downloaded Session size mismatch: {local_thread_id}"
                             )
-                        actual_hash = sha256_bytes(content)
-                        if actual_hash != content_hash:
+                        if sha256_file(content_path) != content_hash:
                             raise RuntimeError(
                                 f"Downloaded Session SHA256 mismatch: {local_thread_id}"
                             )
-                        parse_session_meta(content, local_thread_id)
-                        staged_path = staging_root / f"{content_hash}.jsonl"
-                        staged_path.write_bytes(content)
-                        if sha256_bytes(staged_path.read_bytes()) != content_hash:
-                            raise RuntimeError(
-                                f"Staged Session SHA256 mismatch: {local_thread_id}"
-                            )
-                        staged_by_hash[content_hash] = content
+                        parse_session_meta_file(content_path, local_thread_id)
+                        staged_by_hash[content_hash] = content_path
                         downloaded_objects += 1
 
                 prepared.append(
@@ -212,7 +225,7 @@ class ManualDownloadEngine:
                         relative_path=relative_path,
                         cloud_content_hash=content_hash,
                         file_size=expected_size,
-                        content=content,
+                        content=None,
                         title=str(thread.get("title") or ""),
                         source=str(thread.get("source") or ""),
                         model_provider=str(thread.get("model_provider") or ""),
@@ -229,6 +242,7 @@ class ManualDownloadEngine:
                             else None
                         ),
                         target_cwd=target_cwds[local_thread_id],
+                        content_path=content_path,
                     )
                 )
 

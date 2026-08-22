@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Protocol
 
 from codex_sync.cloud.attachments import AttachmentRepository
@@ -107,6 +108,41 @@ class SnapshotRestoreRepository:
         if storage_path not in allowed:
             raise RuntimeError("Snapshot Session Storage path is not in the selected manifest")
         return self.base_repository.download_session(storage_path, access_token)
+
+    def download_session_to_path(
+        self,
+        user_id: str,
+        storage_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None:
+        allowed = {
+            str(item.get("storage_path") or "")
+            for item in self.manifest.get("sessions", [])
+            if isinstance(item, dict)
+        }
+        if storage_path not in allowed:
+            raise RuntimeError("Snapshot Session Storage path is not in the selected manifest")
+        download_to_path = getattr(
+            self.base_repository,
+            "download_session_to_path",
+            None,
+        )
+        if callable(download_to_path):
+            download_to_path(
+                user_id,
+                storage_path,
+                destination,
+                expected_sha256,
+                expected_size,
+                access_token,
+            )
+            return
+        destination.write_bytes(
+            self.base_repository.download_session(storage_path, access_token)
+        )
 
 
 class SnapshotManager:

@@ -8,6 +8,7 @@ from codex_sync.cloud.devices import DeviceService
 from codex_sync.local.catalog import scan_local_catalog
 from codex_sync.local.repair_engine import Paths
 from codex_sync.models import utc_now
+from codex_sync.progress import emit_progress
 from codex_sync.sync.manifest import build_session_manifest
 from codex_sync.sync.state import SyncStateStore
 from codex_sync.workspace import WorkspaceManager
@@ -50,6 +51,12 @@ class ManualUploadEngine:
         if session is None:
             raise RuntimeError("Sign in to Codex Sync before uploading history")
         local_threads = scan_local_catalog(self.paths)
+        emit_progress(
+            "scan",
+            object_kind="Session",
+            threads=len(local_threads),
+            sessions=len(local_threads),
+        )
         device = self.devices.current_device()
         self.devices.register_current_device()
         workspace_ids = (

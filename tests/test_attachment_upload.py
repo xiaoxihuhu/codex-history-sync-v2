@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from codex_sync.attachments.probe import probe_attachments
 from codex_sync.cloud.attachments import SupabaseAttachmentRepository
+from codex_sync.cloud.storage import StorageObjectSource
 from codex_sync.cloud.supabase_client import HttpResponse, SupabaseClient
 from codex_sync.config import SupabaseConfig
 from codex_sync.hashing import sha256_bytes
@@ -101,6 +102,19 @@ class MemoryAttachmentRepository:
     def upload_object(self, object_path, content, mime_type, access_token):
         self.upload_calls += 1
         self.objects[object_path] = content
+
+    def upload_source(
+        self,
+        user_id,
+        object_path,
+        source: StorageObjectSource,
+        mime_type,
+        access_token,
+    ):
+        with source.open() as handle:
+            content = handle.read()
+        self.upload_object(object_path, content, mime_type, access_token)
+        return object_path
 
     def download_object(self, object_path, access_token):
         return self.objects[object_path]
@@ -395,18 +409,19 @@ class AttachmentUploadTests(unittest.TestCase):
             original_session = session_path.read_bytes()
             from codex_sync.local import attachment_restore
 
-            real_atomic_write = attachment_restore.atomic_write_bytes
             failure_injected = False
 
-            def fail_session_write(path, content):
+            real_rewrite = attachment_restore.atomic_rewrite_session_jsonl
+
+            def fail_session_write(path, replacements):
                 nonlocal failure_injected
                 if path == session_path and not failure_injected:
                     failure_injected = True
                     raise OSError("injected Session write failure")
-                return real_atomic_write(path, content)
+                return real_rewrite(path, replacements)
 
             with patch(
-                "codex_sync.local.attachment_restore.atomic_write_bytes",
+                "codex_sync.local.attachment_restore.atomic_rewrite_session_jsonl",
                 side_effect=fail_session_write,
             ):
                 with self.assertRaisesRegex(OSError, "injected"):

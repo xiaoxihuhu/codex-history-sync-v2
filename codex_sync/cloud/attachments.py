@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
-from codex_sync.cloud.storage import SupabaseStorage
+from codex_sync.cloud.storage import StorageObjectSource, SupabaseStorage
 from codex_sync.cloud.supabase_client import SupabaseClient, SupabaseError
 
 
@@ -24,7 +25,26 @@ class AttachmentRepository(Protocol):
         access_token: str,
     ) -> None: ...
 
+    def upload_source(
+        self,
+        user_id: str,
+        object_path: str,
+        source: StorageObjectSource,
+        mime_type: str,
+        access_token: str,
+    ) -> str: ...
+
     def download_object(self, object_path: str, access_token: str) -> bytes: ...
+
+    def download_object_to_path(
+        self,
+        user_id: str,
+        object_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None: ...
 
     def upsert_attachments(
         self,
@@ -106,8 +126,44 @@ class SupabaseAttachmentRepository:
             access_token=access_token,
         )
 
+    def upload_source(
+        self,
+        user_id: str,
+        object_path: str,
+        source: StorageObjectSource,
+        mime_type: str,
+        access_token: str,
+    ) -> str:
+        return self.storage.upload_source(
+            user_id=user_id,
+            legacy_object_path=object_path,
+            source=source,
+            content_type=mime_type or "application/octet-stream",
+            access_token=access_token,
+            object_kind="Attachment",
+        )
+
     def download_object(self, object_path: str, access_token: str) -> bytes:
         return self.storage.download(object_path, access_token=access_token)
+
+    def download_object_to_path(
+        self,
+        user_id: str,
+        object_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None:
+        self.storage.download_to_path(
+            user_id=user_id,
+            storage_path=object_path,
+            destination=destination,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            access_token=access_token,
+            object_kind="Attachment",
+        )
 
     def upsert_attachments(
         self,

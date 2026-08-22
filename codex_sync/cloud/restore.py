@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
@@ -23,6 +24,16 @@ class RestoreRepository(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     def download_session(self, storage_path: str, access_token: str) -> bytes: ...
+
+    def download_session_to_path(
+        self,
+        user_id: str,
+        storage_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None: ...
 
 
 class SupabaseRestoreRepository:
@@ -86,3 +97,22 @@ class SupabaseRestoreRepository:
 
     def download_session(self, storage_path: str, access_token: str) -> bytes:
         return self.storage.download(storage_path, access_token=access_token)
+
+    def download_session_to_path(
+        self,
+        user_id: str,
+        storage_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None:
+        self.storage.download_to_path(
+            user_id=user_id,
+            storage_path=storage_path,
+            destination=destination,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            access_token=access_token,
+            object_kind="Session",
+        )

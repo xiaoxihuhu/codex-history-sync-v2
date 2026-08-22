@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
-from codex_sync.cloud.storage import SupabaseStorage
+from codex_sync.cloud.storage import StorageObjectSource, SupabaseStorage
 from codex_sync.cloud.supabase_client import SupabaseClient, SupabaseError
 from codex_sync.local.catalog import LocalThreadRecord, StableFile
 
@@ -115,13 +115,18 @@ class SupabaseManualUploadRepository:
         access_token: str,
     ) -> str:
         object_path = f"users/{user_id}/sessions/{stable_file.sha256}.jsonl"
-        self.storage.upload(
-            object_path,
-            stable_file.content,
+        return self.storage.upload_source(
+            user_id=user_id,
+            legacy_object_path=object_path,
+            source=StorageObjectSource.from_path(
+                stable_file.path,
+                stable_file.sha256,
+                stable_file.file_size,
+            ),
             content_type="application/x-ndjson",
             access_token=access_token,
+            object_kind="Session",
         )
-        return object_path
 
     def upsert_sessions(
         self,

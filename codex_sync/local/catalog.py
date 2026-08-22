@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from codex_sync.hashing import sha256_bytes
+from codex_sync.hashing import sha256_bytes, sha256_file
 from codex_sync.local.repair_engine import Paths, connect_db, get_thread_columns
 
 UTC = timezone.utc
@@ -41,10 +41,11 @@ class LocalThreadRecord:
 
 @dataclass(frozen=True)
 class StableFile:
-    content: bytes
+    path: Path
     sha256: str
     file_size: int
     mtime_ns: int
+    content: bytes | None = None
 
 
 def unix_timestamp_to_iso(value: object, *, milliseconds: bool = False) -> str | None:
@@ -189,17 +190,24 @@ def read_stable_file(
     *,
     attempts: int = 3,
     delay_seconds: float = 0.1,
+    load_content: bool = True,
 ) -> StableFile:
     for attempt in range(attempts):
         before = path.stat()
-        content = path.read_bytes()
+        content = path.read_bytes() if load_content else None
+        digest = sha256_bytes(content) if content is not None else sha256_file(path)
         after = path.stat()
-        if before.st_size == after.st_size == len(content) and before.st_mtime_ns == after.st_mtime_ns:
+        content_size = len(content) if content is not None else after.st_size
+        if (
+            before.st_size == after.st_size == content_size
+            and before.st_mtime_ns == after.st_mtime_ns
+        ):
             return StableFile(
-                content=content,
-                sha256=sha256_bytes(content),
-                file_size=len(content),
+                path=path,
+                sha256=digest,
+                file_size=after.st_size,
                 mtime_ns=after.st_mtime_ns,
+                content=content,
             )
         if attempt < attempts - 1:
             time.sleep(delay_seconds)

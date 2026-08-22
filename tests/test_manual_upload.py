@@ -60,7 +60,12 @@ class FakeUploadRepository:
 
     def upload_session_object(self, user_id, stable_file, access_token):
         path = f"users/{user_id}/sessions/{stable_file.sha256}.jsonl"
-        self.uploaded_objects.append((stable_file.sha256, path, stable_file.content))
+        content = (
+            stable_file.content
+            if stable_file.content is not None
+            else stable_file.path.read_bytes()
+        )
+        self.uploaded_objects.append((stable_file.sha256, path, content))
         return path
 
     def upsert_sessions(self, user_id, device_id, rows, access_token):

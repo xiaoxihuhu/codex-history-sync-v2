@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import time
 from dataclasses import asdict, dataclass
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from codex_sync.atomic_io import atomic_write_bytes
+from codex_sync.atomic_io import atomic_write_bytes, atomic_write_stream
 from codex_sync.local.catalog import canonical_comparison_path
 from codex_sync.local.repair_engine import (
     WRITE_LOCK_RETRY_DELAY_SECONDS,
@@ -74,6 +75,7 @@ class PreparedTextRestore:
     codex_created_at: str | None
     codex_updated_at: str | None
     target_cwd: Path
+    content_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,30 @@ def parse_session_meta(content: bytes, expected_thread_id: str) -> tuple[dict[st
     return payload, ending, remainder
 
 
+def parse_session_meta_file(path: Path, expected_thread_id: str) -> dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline()
+    except OSError as exc:
+        raise RuntimeError(f"Session {expected_thread_id} could not be read: {path}") from exc
+    payload, _, _ = parse_session_meta(first_line, expected_thread_id)
+    return payload
+
+
+def adapted_session_payload(
+    payload: dict[str, Any],
+    current_provider: str,
+    current_model: str | None,
+    target_cwd: Path,
+) -> dict[str, Any]:
+    adapted_payload = dict(payload)
+    adapted_payload["model_provider"] = current_provider
+    adapted_payload["cwd"] = str(target_cwd)
+    if current_model and adapted_payload.get("model") is not None:
+        adapted_payload["model"] = current_model
+    return adapted_payload
+
+
 def adapt_session_content(
     content: bytes,
     expected_thread_id: str,
@@ -148,11 +174,12 @@ def adapt_session_content(
     text = content.decode("utf-8")
     first_line, _, _ = split_first_line(text)
     item = json.loads(first_line)
-    adapted_payload = dict(payload)
-    adapted_payload["model_provider"] = current_provider
-    adapted_payload["cwd"] = str(target_cwd)
-    if current_model and adapted_payload.get("model") is not None:
-        adapted_payload["model"] = current_model
+    adapted_payload = adapted_session_payload(
+        payload,
+        current_provider,
+        current_model,
+        target_cwd,
+    )
     item["payload"] = adapted_payload
     adapted_first_line = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
     if ending:
@@ -160,6 +187,50 @@ def adapt_session_content(
     else:
         adapted_text = adapted_first_line
     return adapted_text.encode("utf-8"), adapted_payload
+
+
+def atomic_adapt_session_file(
+    source: Path,
+    target: Path,
+    expected_thread_id: str,
+    current_provider: str,
+    current_model: str | None,
+    target_cwd: Path,
+) -> dict[str, Any]:
+    payload = parse_session_meta_file(source, expected_thread_id)
+    adapted_payload = adapted_session_payload(
+        payload,
+        current_provider,
+        current_model,
+        target_cwd,
+    )
+
+    def write(output: Any) -> None:
+        with source.open("rb") as input_handle:
+            first_line = input_handle.readline()
+            if first_line.endswith(b"\r\n"):
+                ending = b"\r\n"
+            elif first_line.endswith(b"\n"):
+                ending = b"\n"
+            elif first_line.endswith(b"\r"):
+                ending = b"\r"
+            else:
+                ending = b""
+            try:
+                item = json.loads(first_line[: len(first_line) - len(ending)].decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(
+                    f"Session {expected_thread_id} is not valid UTF-8 JSONL"
+                ) from exc
+            item["payload"] = adapted_payload
+            output.write(
+                json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            )
+            output.write(ending)
+            shutil.copyfileobj(input_handle, output, length=1024 * 1024)
+
+    atomic_write_stream(target, write)
+    return adapted_payload
 
 
 def parse_cloud_time(value: str | None) -> tuple[int, int]:
@@ -321,7 +392,7 @@ def verify_restored_history(
         target = target_paths[entry.codex_thread_id]
         if not target.is_file():
             raise RuntimeError(f"Restore verification found missing Session: {target}")
-        parse_session_meta(target.read_bytes(), entry.codex_thread_id)
+        parse_session_meta_file(target, entry.codex_thread_id)
         verified_sessions += 1
 
     index = read_session_index(paths)
@@ -376,7 +447,7 @@ def restore_text_history(
 
     seen_paths: dict[Path, str] = {}
     insert_rows: list[dict[str, object]] = []
-    files_to_create: list[tuple[Path, bytes]] = []
+    files_to_create: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
     existing_sessions = 0
 
     for entry in entries:
@@ -391,21 +462,29 @@ def restore_text_history(
         target_paths[entry.codex_thread_id] = target
 
         if target.exists():
-            content = target.read_bytes()
-            parse_session_meta(content, entry.codex_thread_id)
+            payload = parse_session_meta_file(target, entry.codex_thread_id)
             existing_sessions += 1
         else:
-            if entry.content is None:
+            if entry.content is None and entry.content_path is None:
                 raise RuntimeError(f"Missing downloaded content for Session {entry.codex_thread_id}")
-            content, _ = adapt_session_content(
-                entry.content,
-                entry.codex_thread_id,
-                current_provider,
-                current_model,
-                target_cwd,
-            )
-            files_to_create.append((target, content))
-        payload, _, _ = parse_session_meta(content, entry.codex_thread_id)
+            if entry.content_path is not None:
+                payload = adapted_session_payload(
+                    parse_session_meta_file(entry.content_path, entry.codex_thread_id),
+                    current_provider,
+                    current_model,
+                    target_cwd,
+                )
+            else:
+                adapted_content, payload = adapt_session_content(
+                    entry.content or b"",
+                    entry.codex_thread_id,
+                    current_provider,
+                    current_model,
+                    target_cwd,
+                )
+                files_to_create.append((target, adapted_content, None, entry))
+            if entry.content_path is not None:
+                files_to_create.append((target, None, entry.content_path, entry))
 
         existing = existing_rows.get(entry.codex_thread_id)
         if existing is not None:
@@ -459,10 +538,20 @@ def restore_text_history(
     safety_backup = make_backup(paths, "pre-cloud-restore")
     created_files: list[Path] = []
     try:
-        for target, content in files_to_create:
+        for target, content, content_path, entry in files_to_create:
             if target.exists():
                 raise RuntimeError(f"Session appeared during restore: {target}")
-            atomic_write_bytes(target, content)
+            if content_path is not None:
+                atomic_adapt_session_file(
+                    content_path,
+                    target,
+                    entry.codex_thread_id,
+                    current_provider,
+                    current_model,
+                    target_cwds[entry.codex_thread_id],
+                )
+            else:
+                atomic_write_bytes(target, content or b"")
             created_files.append(target)
 
         insert_threads_with_retry(paths, insert_rows, columns)

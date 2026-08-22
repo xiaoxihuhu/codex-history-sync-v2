@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, BinaryIO, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -49,6 +49,43 @@ class UrllibTransport:
                 status=int(exc.code),
                 body=exc.read(),
                 headers=dict(exc.headers.items()) if exc.headers else {},
+            )
+        except URLError as exc:
+            raise SupabaseError("Supabase network request failed", cause=exc) from exc
+
+    def download_to_file(
+        self,
+        url: str,
+        headers: Mapping[str, str],
+        destination: BinaryIO,
+        timeout: float,
+        on_chunk: Callable[[bytes], None] | None = None,
+    ) -> tuple[HttpResponse, int]:
+        request = Request(url=url, headers=dict(headers), method="GET")
+        written = 0
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                while chunk := response.read(1024 * 1024):
+                    destination.write(chunk)
+                    written += len(chunk)
+                    if on_chunk is not None:
+                        on_chunk(chunk)
+                return (
+                    HttpResponse(
+                        status=int(response.status),
+                        body=b"",
+                        headers=dict(response.headers.items()),
+                    ),
+                    written,
+                )
+        except HTTPError as exc:
+            return (
+                HttpResponse(
+                    status=int(exc.code),
+                    body=exc.read(),
+                    headers=dict(exc.headers.items()) if exc.headers else {},
+                ),
+                written,
             )
         except URLError as exc:
             raise SupabaseError("Supabase network request failed", cause=exc) from exc
@@ -184,6 +221,56 @@ class SupabaseClient:
                 [self.config.public_key, access_token],
             )
         return response.body
+
+    def download_to_file(
+        self,
+        path: str,
+        destination: BinaryIO,
+        *,
+        access_token: str,
+        on_chunk: Callable[[bytes], None] | None = None,
+        expected_statuses: tuple[int, ...] = (200,),
+    ) -> int:
+        headers = {
+            "Accept": "application/octet-stream",
+            "apikey": self.config.public_key,
+            "Authorization": f"Bearer {access_token}",
+        }
+        stream = getattr(self.transport, "download_to_file", None)
+        if callable(stream):
+            response, written = stream(
+                f"{self.config.project_url}{path}",
+                headers,
+                destination,
+                self.timeout_seconds,
+                on_chunk,
+            )
+        else:
+            response = self.transport.request(
+                "GET",
+                f"{self.config.project_url}{path}",
+                headers,
+                None,
+                self.timeout_seconds,
+            )
+            written = 0
+            if response.status in expected_statuses:
+                destination.write(response.body)
+                written = len(response.body)
+                if on_chunk is not None and response.body:
+                    on_chunk(response.body)
+
+        if response.status not in expected_statuses:
+            try:
+                decoded = decode_json(response.body)
+            except SupabaseError:
+                decoded = {}
+            raise error_from_response(
+                response.status,
+                decoded,
+                [self.config.public_key, access_token],
+            )
+        return written
 
 
 def decode_json(body: bytes) -> Any:

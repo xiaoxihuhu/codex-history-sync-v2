@@ -2,6 +2,12 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.1-rc2] - 2026-08-22
+
+- 将 GUI 长任务改为同一 EXE 的隔离 QProcess internal CLI，增加即时状态、耗时和字节进度反馈。
+- 增加 Session 与 Attachment 通用 40 MiB 分片传输、断点复用、流式恢复和完整 SHA256 校验。
+- 保持现有数据库 Schema、RLS、Storage Policy 和旧版 single-object 云端数据兼容。
+
 ## [2.0.1-rc1] - 2026-08-22
 
 - 增加首次 Supabase 配置、登录和登出 GUI。

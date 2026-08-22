@@ -32,7 +32,7 @@ def session_object_key(thread: LocalThreadRecord) -> str:
 def build_session_manifest(threads: list[LocalThreadRecord]) -> list[ManifestEntry]:
     entries: list[ManifestEntry] = []
     for thread in threads:
-        stable = read_stable_file(thread.session.path)
+        stable = read_stable_file(thread.session.path, load_content=False)
         entries.append(
             ManifestEntry(
                 object_kind="session",

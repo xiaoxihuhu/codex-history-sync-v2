@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import json
+import os
 import time
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from codex_sync.local.repair_engine import (
     restore_backup,
     sync_to_current_provider,
 )
+from codex_sync.progress import emit_progress
 from codex_sync.sync import SyncStateStore
 from codex_sync.sync.download import ManualDownloadEngine
 from codex_sync.sync.download_attachments import AttachmentDownloadEngine
@@ -44,6 +46,8 @@ from codex_sync.versioning import CombinedSnapshotSource, SnapshotManager
 
 
 def to_json(payload: dict[str, object]) -> str:
+    if os.environ.get("CODEX_SYNC_JSON_LINES") == "1":
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
@@ -417,6 +421,7 @@ def main() -> int:
             raise RuntimeError(f"Unsupported command: {args.command}")
     except Exception as exc:
         error_payload = {"ok": False, "error": str(exc)}
+        emit_progress("complete", ok=False, error=str(exc))
         if args.json:
             print(to_json(error_payload))
         else:
@@ -424,6 +429,7 @@ def main() -> int:
         return 1
 
     payload["ok"] = True
+    emit_progress("complete", ok=True, task=args.command)
     if args.json:
         print(to_json(payload))
     else:
