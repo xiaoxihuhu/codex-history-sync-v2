@@ -52,7 +52,7 @@ class CompatibilityTests(unittest.TestCase):
             self.assertEqual(args.command, command)
 
     def test_v2_package_has_release_version(self) -> None:
-        self.assertEqual(__version__, "2.0.0")
+        self.assertEqual(__version__, "2.0.1")
 
 
 if __name__ == "__main__":
