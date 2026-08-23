@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
@@ -18,7 +19,7 @@ from PySide6.QtWidgets import QApplication, QLineEdit
 
 from codex_sync.config import default_app_paths, load_supabase_config
 from codex_sync.gui import HistorySyncWindow, execute_cli
-from launch_gui import _internal_command_name
+from launch_gui import _internal_cli_main, _internal_command_name
 
 
 class GuiTests(unittest.TestCase):
@@ -240,18 +241,20 @@ class GuiTests(unittest.TestCase):
     def test_workspace_row_mapping_passes_hidden_workspace_id_to_cli(self) -> None:
         window, calls = self.window()
         window.refresh_workspaces = mock.Mock()  # type: ignore[method-assign]
+        workspace_name = "shopyy���"
         window._apply_workspaces(
             {
                 "workspaces": [
                     {
                         "workspace_id": "workspace-id-1",
-                        "name": "shop-tool",
+                        "name": workspace_name,
                         "cloud_device_path": r"C:\Source\shop-tool",
                         "mapped": False,
                     }
                 ]
             }
         )
+        self.assertEqual(window.workspace_table.item(0, 0).text(), workspace_name)
         target = Path(self.temp_dir.name) / "shop-tool"
         target.mkdir()
         window.map_workspace_row(0, target)
@@ -266,12 +269,58 @@ class GuiTests(unittest.TestCase):
             ],
         )
 
+    def test_internal_cli_forces_utf8_stdout_for_replacement_characters(self) -> None:
+        from codex_sync import cli
+
+        output_bytes = io.BytesIO()
+        output = io.TextIOWrapper(output_bytes, encoding="gbk", newline="")
+        original_json_lines = os.environ.get("CODEX_SYNC_JSON_LINES")
+
+        def fake_main() -> int:
+            print(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "action": "workspace-list",
+                        "workspaces": [{"name": "shopyy���"}],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+
+        try:
+            with (
+                mock.patch("launch_gui.sys.stdout", output),
+                mock.patch(
+                    "launch_gui.sys.argv",
+                    ["launch_gui.py", "--internal-cli", "--json", "workspace-list"],
+                ),
+                mock.patch("codex_sync.cli.main", side_effect=fake_main),
+            ):
+                self.assertEqual(_internal_cli_main(), 0)
+            output.flush()
+            lines = [
+                json.loads(line)
+                for line in output_bytes.getvalue().decode("utf-8").splitlines()
+                if line
+            ]
+        finally:
+            output.detach()
+            if original_json_lines is None:
+                os.environ.pop("CODEX_SYNC_JSON_LINES", None)
+            else:
+                os.environ["CODEX_SYNC_JSON_LINES"] = original_json_lines
+
+        result = next(item for item in lines if item.get("ok") is True)
+        self.assertEqual(result["workspaces"][0]["name"], "shopyy���")
+
     def test_bulk_workspace_mapping_creates_safe_subdirectories(self) -> None:
         window, calls = self.window()
         window.refresh_workspaces = mock.Mock()  # type: ignore[method-assign]
         window._workspace_rows = [
-            {"workspace_id": "one", "name": "api:project"},
-            {"workspace_id": "two", "name": "api:project"},
+            {"workspace_id": "one", "name": "shopyy���"},
+            {"workspace_id": "two", "name": "shopyy���"},
         ]
         root = Path(self.temp_dir.name) / "Recovered"
         window.map_all_workspaces_to(root)
@@ -284,6 +333,8 @@ class GuiTests(unittest.TestCase):
         paths = [Path(command[-1]) for command in mapped_commands]
         self.assertTrue(all(path.is_dir() for path in paths))
         self.assertNotEqual(paths[0].name.casefold(), paths[1].name.casefold())
+        self.assertTrue(paths[0].name.startswith("shopyy���"))
+        self.assertTrue(paths[1].name.startswith("shopyy���"))
 
     def test_original_backup_and_restore_buttons_keep_original_commands(self) -> None:
         window, calls = self.window()

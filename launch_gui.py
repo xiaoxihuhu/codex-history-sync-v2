@@ -17,10 +17,22 @@ def _internal_command_name(cli_module: object, arguments: list[str]) -> str:
     return next((value for value in arguments if value in command_names), "unknown")
 
 
+def _configure_internal_stdout() -> None:
+    stream = getattr(sys, "stdout", None)
+    reconfigure = getattr(stream, "reconfigure", None)
+    if not callable(reconfigure):
+        return
+    try:
+        reconfigure(encoding="utf-8", errors="strict", newline="\n")
+    except (AttributeError, OSError, ValueError):
+        return
+
+
 def _internal_cli_main() -> int:
     from codex_sync import cli
     from codex_sync.progress import set_progress_sink
 
+    _configure_internal_stdout()
     sys.argv.remove("--internal-cli")
     os.environ["CODEX_SYNC_JSON_LINES"] = "1"
     secret_count = int(os.environ.pop("CODEX_SYNC_INTERNAL_SECRET_COUNT", "0") or "0")
