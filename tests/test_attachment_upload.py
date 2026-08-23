@@ -19,6 +19,7 @@ from codex_sync.config import SupabaseConfig
 from codex_sync.hashing import sha256_bytes
 from codex_sync.local.repair_engine import resolve_paths
 from codex_sync.models import AuthSession, DeviceIdentity
+from codex_sync.sync.download import ManualDownloadEngine
 from codex_sync.sync.upload_attachments import AttachmentUploadEngine
 from codex_sync.sync.download_attachments import AttachmentDownloadEngine
 
@@ -87,8 +88,23 @@ class MemoryAttachmentRepository:
         self.objects: dict[str, bytes] = {}
         self.upload_calls = 0
 
-    def list_threads(self, user_id, access_token):
-        return list(self.thread_rows)
+    def list_threads(
+        self,
+        user_id,
+        access_token,
+        codex_thread_id=None,
+        workspace_id=None,
+    ):
+        rows = list(self.thread_rows)
+        if codex_thread_id:
+            rows = [
+                row for row in rows if row.get("codex_thread_id") == codex_thread_id
+            ]
+        if workspace_id:
+            rows = [
+                row for row in rows if row.get("workspace_id") == workspace_id
+            ]
+        return rows
 
     def list_sessions(self, user_id, access_token):
         return list(self.session_rows)
@@ -118,6 +134,9 @@ class MemoryAttachmentRepository:
 
     def download_object(self, object_path, access_token):
         return self.objects[object_path]
+
+    def download_session(self, storage_path, access_token):
+        return self.objects[storage_path]
 
     def upsert_attachments(self, user_id, device_id, rows, access_token):
         mapping = {}
@@ -273,6 +292,74 @@ def create_attachment_restore_target(root: Path, source_home: Path) -> Path:
     return target
 
 
+def expand_attachment_fixture(source_home: Path) -> None:
+    session_path = (
+        source_home / "sessions" / "2026" / "08" / "21"
+        / "rollout-attachment-fixture.jsonl"
+    )
+    extra_paths: list[Path] = []
+    attachments_root = source_home / "attachments"
+    for index in range(31):
+        path = attachments_root / f"bulk-{index:02d}" / f"fixture-{index:02d}.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"bulk attachment {index}\n", encoding="utf-8")
+        extra_paths.append(path)
+
+    with session_path.open("a", encoding="utf-8") as handle:
+        for index in range(145):
+            path = extra_paths[index % len(extra_paths)]
+            item = {
+                "type": "response_item",
+                "payload": {
+                    "id": f"bulk-message-{index:03d}",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_file",
+                            "file_path": str(path),
+                        }
+                    ],
+                },
+            }
+            handle.write(json.dumps(item, separators=(",", ":")) + "\n")
+
+
+def prepare_cloud_session_manifest(
+    repository: MemoryAttachmentRepository,
+    source_home: Path,
+) -> None:
+    session_path = (
+        source_home / "sessions" / "2026" / "08" / "21"
+        / "rollout-attachment-fixture.jsonl"
+    )
+    content = session_path.read_bytes()
+    digest = sha256_bytes(content)
+    relative_path = str(session_path.relative_to(source_home)).replace("\\", "/")
+    storage_path = f"users/{USER_ID}/sessions/{digest}.jsonl"
+    repository.objects[storage_path] = content
+    repository.thread_rows[0].update(
+        {
+            "workspace_id": None,
+            "rollout_relative_path": relative_path,
+            "title": "Attachment conflict fixture",
+            "source": "vscode",
+            "model_provider": "openai",
+            "model": None,
+            "original_cwd": str(source_home),
+            "archived": False,
+            "codex_created_at": None,
+            "codex_updated_at": None,
+        }
+    )
+    repository.session_rows[0].update(
+        {
+            "content_hash": digest,
+            "file_size": len(content),
+            "storage_path": storage_path,
+        }
+    )
+
+
 class AttachmentUploadTests(unittest.TestCase):
     def test_deduplicates_embedded_image_and_uploads_text_pdf_and_references(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -389,6 +476,112 @@ class AttachmentUploadTests(unittest.TestCase):
             self.assertEqual(second.local_restore.created_files, 0)
             self.assertEqual(second.local_restore.rewritten_sessions, 0)
             self.assertIsNone(second.local_restore.safety_backup)
+
+    def test_session_conflict_cloud_wins_then_restores_34_attachments_and_150_references(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_attachment_home(root / "TestComputerA")
+            expand_attachment_fixture(source)
+            repository = MemoryAttachmentRepository()
+            upload_summary = AttachmentUploadEngine(
+                resolve_paths(str(source)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).upload()
+            prepare_cloud_session_manifest(repository, source)
+
+            self.assertEqual(upload_summary.unique_attachments, 34)
+            self.assertEqual(upload_summary.verified_references, 150)
+
+            target = create_attachment_restore_target(root, source)
+            target_session = (
+                target / "sessions" / "2026" / "08" / "21"
+                / "rollout-attachment-fixture.jsonl"
+            )
+            target_session.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": THREAD_ID,
+                            "session_id": SESSION_ID,
+                            "model_provider": "openai",
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            history_summary = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=root,
+                replace_conflicting_sessions=True,
+            )
+            self.assertEqual(history_summary.replaced_conflicting_sessions, 1)
+
+            from codex_sync.local import attachment_restore
+
+            failure_injected = False
+            real_rewrite = attachment_restore.atomic_rewrite_session_jsonl
+
+            def fail_attachment_rewrite(path, replacements):
+                nonlocal failure_injected
+                if not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected partial attachment restore failure")
+                return real_rewrite(path, replacements)
+
+            with patch(
+                "codex_sync.local.attachment_restore.atomic_rewrite_session_jsonl",
+                side_effect=fail_attachment_rewrite,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "injected partial attachment restore failure",
+                ):
+                    AttachmentDownloadEngine(
+                        resolve_paths(str(target)),
+                        FakeAuth(),
+                        FakeDevices(),
+                        repository,
+                    ).restore()
+
+            retry_history = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=root,
+                replace_conflicting_sessions=True,
+            )
+            self.assertEqual(retry_history.reused_local_sessions, 1)
+            self.assertEqual(retry_history.replaced_conflicting_sessions, 0)
+
+            attachment_summary = AttachmentDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore()
+
+            self.assertEqual(attachment_summary.cloud_attachments, 34)
+            self.assertEqual(attachment_summary.downloaded_objects, 34)
+            self.assertEqual(attachment_summary.local_restore.verified_files, 34)
+            self.assertGreaterEqual(
+                attachment_summary.local_restore.rewritten_references,
+                148,
+            )
+            probe = probe_attachments(target).to_dict()
+            self.assertEqual(probe["summary"]["unique_content_hashes"], 34)
+            self.assertEqual(probe["summary"]["missing"], 0)
 
     def test_attachment_session_write_failure_rolls_back_created_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

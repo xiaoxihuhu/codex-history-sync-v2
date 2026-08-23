@@ -11,11 +11,15 @@ from typing import Mapping
 from codex_sync.cloud.restore import SupabaseRestoreRepository
 from codex_sync.cloud.supabase_client import HttpResponse, SupabaseClient
 from codex_sync.config import SupabaseConfig
-from codex_sync.hashing import sha256_bytes
+from codex_sync.hashing import sha256_bytes, sha256_file
 from codex_sync.local.repair_engine import get_status, read_session_index, resolve_paths
 from codex_sync.models import AuthSession, DeviceIdentity
-from codex_sync.sync.download import ManualDownloadEngine
+from codex_sync.sync.download import (
+    ManualDownloadEngine,
+    SessionContentConflictError,
+)
 from codex_sync.sync.upload import ManualUploadEngine
+from unittest.mock import patch
 
 ACTIVE_THREAD_ID = "11111111-1111-4111-8111-111111111111"
 ARCHIVED_THREAD_ID = "22222222-2222-4222-8222-222222222222"
@@ -302,6 +306,48 @@ def upload_test_computer_a(codex_home: Path) -> MemoryCloudRepository:
     return repository
 
 
+def cloud_session_row(
+    repository: MemoryCloudRepository,
+    thread_id: str = ACTIVE_THREAD_ID,
+) -> dict[str, object]:
+    return next(
+        row
+        for row in repository.sessions.values()
+        if row["thread_id"] == f"cloud-{thread_id}"
+    )
+
+
+def write_conflicting_session(
+    target: Path,
+    repository: MemoryCloudRepository,
+    *,
+    thread_id: str = ACTIVE_THREAD_ID,
+) -> tuple[Path, bytes, dict[str, object]]:
+    row = cloud_session_row(repository, thread_id)
+    relative_path = str(row["relative_path"])
+    session_path = target.joinpath(*Path(relative_path).parts)
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        json.dumps(
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": thread_id,
+                    "session_id": "local-conflicting-session",
+                    "model_provider": "openai",
+                    "model": "gpt-source",
+                    "cwd": r"C:\Users\ComputerB\Projects\local",
+                },
+            },
+            separators=(",", ":"),
+        )
+        + "\n"
+        + '{"type":"event_msg","payload":{"message":"local version"}}\n'
+    ).encode("utf-8")
+    session_path.write_bytes(content)
+    return session_path, content, row
+
+
 class TextRestoreTests(unittest.TestCase):
     def test_computer_a_cloud_computer_b_restore_and_missing_only_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -339,12 +385,12 @@ class TextRestoreTests(unittest.TestCase):
             self.assertEqual(first.local_restore.verified_threads, 2)
             self.assertIsNotNone(first.local_restore.safety_backup)
             self.assertTrue(Path(first.local_restore.safety_backup).is_file())
-            self.assertEqual(second.downloaded_session_objects, 0)
+            self.assertEqual(second.downloaded_session_objects, 2)
             self.assertEqual(second.reused_local_sessions, 2)
             self.assertEqual(second.local_restore.inserted_threads, 0)
             self.assertEqual(second.local_restore.created_sessions, 0)
             self.assertIsNone(second.local_restore.safety_backup)
-            self.assertEqual(repository.download_calls, 2)
+            self.assertEqual(repository.download_calls, 4)
 
             with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
                 rows = conn.execute(
@@ -405,6 +451,303 @@ class TextRestoreTests(unittest.TestCase):
             with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
                 ids = [row[0] for row in conn.execute("SELECT id FROM threads")]
             self.assertEqual(ids, [ACTIVE_THREAD_ID])
+
+    def test_default_restore_blocks_same_path_session_content_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="target-provider",
+                model="gpt-target",
+                populated=False,
+            )
+            session_path, original_content, row = write_conflicting_session(
+                target,
+                repository,
+            )
+
+            with self.assertRaises(SessionContentConflictError) as raised:
+                ManualDownloadEngine(
+                    resolve_paths(str(target)),
+                    FakeAuth(),
+                    FakeDevices(),
+                    repository,
+                ).restore(target_cwd=root)
+
+            conflict = raised.exception.conflict
+            self.assertEqual(conflict.relative_path, str(row["relative_path"]))
+            self.assertEqual(conflict.codex_session_id, str(row["codex_session_id"]))
+            self.assertEqual(conflict.local_sha256, sha256_bytes(original_content))
+            self.assertEqual(conflict.cloud_sha256, str(row["content_hash"]))
+            self.assertEqual(conflict.local_file_size, len(original_content))
+            self.assertEqual(conflict.cloud_file_size, int(row["file_size"]))
+            self.assertIn("local_sha256=", str(raised.exception))
+            self.assertIn("cloud_sha256=", str(raised.exception))
+            self.assertEqual(session_path.read_bytes(), original_content)
+            self.assertEqual(repository.download_calls, 1)
+            self.assertFalse((target / "history_sync_backups").exists())
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 0)
+
+    def test_cloud_wins_replaces_conflict_atomically_and_preserves_cloud_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="target-provider",
+                model="gpt-target",
+                populated=False,
+            )
+            session_path, original_content, row = write_conflicting_session(
+                target,
+                repository,
+            )
+
+            summary = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=root,
+                replace_conflicting_sessions=True,
+            )
+
+            cloud_content = repository.objects[str(row["storage_path"])]
+            self.assertEqual(summary.replaced_conflicting_sessions, 1)
+            self.assertEqual(summary.downloaded_session_objects, 2)
+            self.assertEqual(summary.local_restore.existing_sessions, 1)
+            self.assertEqual(summary.local_restore.inserted_threads, 2)
+            self.assertEqual(session_path.read_bytes(), cloud_content)
+            self.assertEqual(sha256_file(session_path), str(row["content_hash"]))
+            self.assertNotEqual(session_path.read_bytes(), original_content)
+            self.assertEqual(repository.download_calls, 2)
+            self.assertIn(ACTIVE_THREAD_ID, read_session_index(resolve_paths(str(target))))
+
+    def test_conflict_download_or_hash_failure_preserves_local_session(self) -> None:
+        for failure_kind in ("download", "hash"):
+            with self.subTest(failure_kind=failure_kind):
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    root = Path(temp_dir)
+                    source = create_modern_codex_home(
+                        root,
+                        "TestComputerA",
+                        provider="openai",
+                        model="gpt-source",
+                        populated=True,
+                    )
+                    repository = upload_test_computer_a(source)
+                    target = create_modern_codex_home(
+                        root,
+                        "TestComputerB",
+                        provider="openai",
+                        model="gpt-source",
+                        populated=False,
+                    )
+                    session_path, original_content, row = write_conflicting_session(
+                        target,
+                        repository,
+                    )
+                    if failure_kind == "download":
+                        repository.download_session = lambda *_args: (_ for _ in ()).throw(
+                            OSError("injected Session download failure")
+                        )
+                        expected_error = "injected Session download failure"
+                    else:
+                        storage_path = str(row["storage_path"])
+                        cloud_content = repository.objects[storage_path]
+                        repository.objects[storage_path] = (
+                            bytes([cloud_content[0] ^ 1]) + cloud_content[1:]
+                        )
+                        expected_error = "SHA256 mismatch"
+
+                    engine = ManualDownloadEngine(
+                        resolve_paths(str(target)),
+                        FakeAuth(),
+                        FakeDevices(),
+                        repository,
+                    )
+                    if failure_kind == "download":
+                        with self.assertRaisesRegex(OSError, expected_error):
+                            engine.restore(
+                                target_cwd=root,
+                                replace_conflicting_sessions=True,
+                            )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, expected_error):
+                            engine.restore(
+                                target_cwd=root,
+                                replace_conflicting_sessions=True,
+                            )
+
+                    self.assertEqual(session_path.read_bytes(), original_content)
+                    with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                        self.assertEqual(
+                            conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0],
+                            0,
+                        )
+
+    def test_atomic_replace_failure_preserves_local_session_and_retry_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=False,
+            )
+            session_path, original_content, _row = write_conflicting_session(
+                target,
+                repository,
+            )
+            from codex_sync.local import restore_engine
+
+            real_atomic_copy = restore_engine.atomic_copy_file
+            failure_injected = False
+
+            def fail_once(source_path: Path, destination: Path) -> None:
+                nonlocal failure_injected
+                if destination == session_path and not failure_injected:
+                    failure_injected = True
+                    raise OSError("injected atomic replacement failure")
+                real_atomic_copy(source_path, destination)
+
+            with patch(
+                "codex_sync.local.restore_engine.atomic_copy_file",
+                side_effect=fail_once,
+            ):
+                with self.assertRaisesRegex(OSError, "injected atomic replacement failure"):
+                    ManualDownloadEngine(
+                        resolve_paths(str(target)),
+                        FakeAuth(),
+                        FakeDevices(),
+                        repository,
+                    ).restore(
+                        target_cwd=root,
+                        replace_conflicting_sessions=True,
+                    )
+
+            self.assertEqual(session_path.read_bytes(), original_content)
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 0)
+
+            retry = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=root,
+                replace_conflicting_sessions=True,
+            )
+            self.assertEqual(retry.replaced_conflicting_sessions, 1)
+            self.assertEqual(retry.local_restore.verified_sessions, 2)
+            self.assertNotEqual(session_path.read_bytes(), original_content)
+
+            rerun = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(target_cwd=root)
+            self.assertEqual(rerun.reused_local_sessions, 2)
+            self.assertEqual(rerun.downloaded_session_objects, 1)
+
+    def test_cloud_wins_handles_a_52mb_session_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            row = cloud_session_row(repository)
+            target_size = 52 * 1024 * 1024
+            first_line = (
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": ACTIVE_THREAD_ID,
+                            "session_id": "large-session",
+                            "model_provider": "openai",
+                            "model": "gpt-source",
+                            "cwd": r"C:\Users\ComputerA\Projects\history",
+                        },
+                    },
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                + b"\n"
+            )
+            prefix = b'{"type":"event_msg","payload":{"message":"'
+            suffix = b'"}}\n'
+            fill_size = target_size - len(first_line) - len(prefix) - len(suffix)
+            self.assertGreater(fill_size, 0)
+            cloud_content = first_line + prefix + (b"x" * fill_size) + suffix
+            digest = sha256_bytes(cloud_content)
+            old_storage_path = str(row["storage_path"])
+            repository.objects.pop(old_storage_path)
+            storage_path = f"users/{USER_ID}/sessions/{digest}.jsonl"
+            repository.objects[storage_path] = cloud_content
+            row["content_hash"] = digest
+            row["file_size"] = len(cloud_content)
+            row["storage_path"] = storage_path
+
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=False,
+            )
+            session_path, _original_content, _ = write_conflicting_session(
+                target,
+                repository,
+            )
+
+            summary = ManualDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=root,
+                replace_conflicting_sessions=True,
+            )
+
+            self.assertEqual(summary.replaced_conflicting_sessions, 1)
+            self.assertEqual(session_path.stat().st_size, target_size)
+            self.assertEqual(sha256_file(session_path), digest)
 
     def test_restore_supports_legacy_threads_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

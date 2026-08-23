@@ -96,10 +96,12 @@ class ScriptedRunner:
             command: list(items) for command, items in responses.items()
         }
         self.calls: list[str] = []
+        self.arguments: list[list[str]] = []
 
     def __call__(self, arguments: list[str]) -> tuple[int, dict[str, object]]:
         command = arguments[0]
         self.calls.append(command)
+        self.arguments.append(list(arguments))
         queue = self.responses.get(command)
         if not queue:
             return 1, {"ok": False, "error": f"Unexpected command: {command}"}
@@ -120,6 +122,10 @@ class GuiFlowTests(unittest.TestCase):
         self.assertIn(
             "项目目录未映射",
             human_error("Workspace abc is not mapped on this device"),
+        )
+        self.assertIn(
+            "请使用完整恢复处理冲突",
+            human_error("Session content conflict: relative_path=sessions/example.jsonl"),
         )
 
     def test_windows_workspace_name_is_safe(self) -> None:
@@ -244,6 +250,10 @@ class GuiFlowTests(unittest.TestCase):
                 "status",
                 "probe-attachments",
             ],
+        )
+        self.assertEqual(
+            runner.arguments[4],
+            ["cloud-restore", "--replace-conflicting-sessions"],
         )
         self.assertEqual(result.final_status["total_threads"], 33)
 
