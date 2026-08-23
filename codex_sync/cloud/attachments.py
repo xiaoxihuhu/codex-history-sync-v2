@@ -15,6 +15,16 @@ class AttachmentRepository(Protocol):
 
     def download_session(self, storage_path: str, access_token: str) -> bytes: ...
 
+    def download_session_to_path(
+        self,
+        user_id: str,
+        storage_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None: ...
+
     def list_attachments(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
 
     def list_references(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
@@ -160,6 +170,25 @@ class SupabaseAttachmentRepository:
 
     def download_session(self, storage_path: str, access_token: str) -> bytes:
         return self.storage.download(storage_path, access_token=access_token)
+
+    def download_session_to_path(
+        self,
+        user_id: str,
+        storage_path: str,
+        destination: Path,
+        expected_sha256: str,
+        expected_size: int,
+        access_token: str,
+    ) -> None:
+        self.storage.download_to_path(
+            user_id=user_id,
+            storage_path=storage_path,
+            destination=destination,
+            expected_sha256=expected_sha256,
+            expected_size=expected_size,
+            access_token=access_token,
+            object_kind="Session",
+        )
 
     def download_object_to_path(
         self,
