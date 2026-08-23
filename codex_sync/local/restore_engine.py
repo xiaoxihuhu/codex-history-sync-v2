@@ -22,18 +22,20 @@ from codex_sync.local.repair_engine import (
     connect_db,
     ensure_environment,
     get_thread_columns,
+    iso_utc_from_unix,
     is_locked_error,
     make_backup,
+    parse_index_timestamp,
     parse_current_model,
     parse_current_provider,
     read_session_index,
     read_text,
-    rebuild_session_index,
     restore_database_with_retry,
     restore_metadata,
     split_first_line,
     sync_session_records,
     update_provider_assignments,
+    write_session_index,
 )
 
 UTC = timezone.utc
@@ -77,6 +79,8 @@ class PreparedTextRestore:
     codex_created_at: str | None
     codex_updated_at: str | None
     target_cwd: Path
+    index_thread_name: str | None = None
+    index_updated_at: str | None = None
     content_path: Path | None = None
     replace_existing: bool = False
 
@@ -85,6 +89,7 @@ class PreparedTextRestore:
 class LocalRestoreSummary:
     selected_threads: int
     inserted_threads: int
+    reconciled_threads: int
     created_sessions: int
     existing_sessions: int
     verified_threads: int
@@ -314,6 +319,44 @@ def build_thread_values(
     }
 
 
+def build_reconcile_thread_values(
+    entry: PreparedTextRestore,
+    target_path: Path,
+    target_cwd: Path,
+    current_provider: str,
+    current_model: str | None,
+    session_meta: dict[str, Any],
+) -> dict[str, object]:
+    values: dict[str, object] = {
+        "rollout_path": str(target_path),
+        "cwd": str(target_cwd),
+        "title": entry.title,
+        "archived": int(entry.archived),
+        "model_provider": current_provider,
+    }
+    source = entry.source or str(session_meta.get("source") or "")
+    if source:
+        values["source"] = source
+    chosen_model = current_model or entry.model
+    if chosen_model is not None:
+        values["model"] = chosen_model
+    thread_source = str(session_meta.get("thread_source") or "")
+    if thread_source:
+        values["thread_source"] = thread_source
+    history_mode = str(session_meta.get("history_mode") or "")
+    if history_mode:
+        values["history_mode"] = history_mode
+    if entry.codex_created_at:
+        created_at, created_at_ms = parse_cloud_time(entry.codex_created_at)
+        values["created_at"] = created_at
+        values["created_at_ms"] = created_at_ms
+    if entry.codex_updated_at:
+        updated_at, updated_at_ms = parse_cloud_time(entry.codex_updated_at)
+        values["updated_at"] = updated_at
+        values["updated_at_ms"] = updated_at_ms
+    return values
+
+
 def validate_insert_values(
     columns: dict[str, ThreadColumn],
     values: dict[str, object],
@@ -333,12 +376,13 @@ def validate_insert_values(
         )
 
 
-def insert_threads_with_retry(
+def apply_thread_changes_with_retry(
     paths: Paths,
-    rows: list[dict[str, object]],
+    insert_rows: list[dict[str, object]],
+    update_rows: list[tuple[str, dict[str, object]]],
     columns: dict[str, ThreadColumn],
 ) -> None:
-    if not rows:
+    if not insert_rows and not update_rows:
         return
     last_error: sqlite3.OperationalError | None = None
     for attempt in range(1, WRITE_LOCK_RETRY_LIMIT + 1):
@@ -349,7 +393,7 @@ def insert_threads_with_retry(
                 timeout_seconds=WRITE_OPERATION_TIMEOUT_SECONDS,
             ) as conn:
                 conn.execute("BEGIN IMMEDIATE")
-                for values in rows:
+                for values in insert_rows:
                     selected = [name for name in values if name in columns]
                     placeholders = ", ".join("?" for _ in selected)
                     names = ", ".join(f'"{name}"' for name in selected)
@@ -357,6 +401,19 @@ def insert_threads_with_retry(
                         f"INSERT INTO threads ({names}) VALUES ({placeholders})",
                         [values[name] for name in selected],
                     )
+                for thread_id, values in update_rows:
+                    selected = [name for name in values if name in columns]
+                    if not selected:
+                        continue
+                    assignments = ", ".join(f'"{name}" = ?' for name in selected)
+                    updated = conn.execute(
+                        f"UPDATE threads SET {assignments} WHERE id = ?",
+                        [*(values[name] for name in selected), thread_id],
+                    ).rowcount
+                    if updated != 1:
+                        raise RuntimeError(
+                            f"Existing Thread disappeared during cloud restore: {thread_id}"
+                        )
                 conn.commit()
                 checkpoint(conn)
             return
@@ -368,6 +425,103 @@ def insert_threads_with_retry(
                 raise RuntimeError("Codex database stayed busy during cloud restore") from exc
             time.sleep(WRITE_LOCK_RETRY_DELAY_SECONDS)
     raise RuntimeError("Database restore retry loop ended unexpectedly") from last_error
+
+
+def _valid_existing_index_name(entry: dict[str, str] | None, thread_id: str) -> bool:
+    if not entry:
+        return False
+    name = str(entry.get("thread_name") or "").strip()
+    return bool(name and name != thread_id)
+
+
+def rebuild_restored_session_index(
+    paths: Paths,
+    conn: sqlite3.Connection,
+    entries: list[PreparedTextRestore],
+) -> dict[str, int]:
+    existing_entries = read_session_index(paths)
+    selected_entries = {entry.codex_thread_id: entry for entry in entries}
+    columns = get_thread_columns(conn)
+    select_parts = ["id"]
+    for name in ("title", "updated_at", "archived"):
+        if name in columns:
+            select_parts.append(name)
+    rows = conn.execute(
+        f"SELECT {', '.join(select_parts)} FROM threads ORDER BY id"
+    ).fetchall()
+    db_ids = {str(row["id"]) for row in rows}
+    merged: list[dict[str, str]] = []
+
+    for row in rows:
+        thread_id = str(row["id"])
+        selected = selected_entries.get(thread_id)
+        existing_entry = existing_entries.get(thread_id)
+        archived = bool(row["archived"]) if "archived" in row.keys() else False
+
+        if selected is not None:
+            if archived:
+                continue
+            if selected.index_thread_name:
+                thread_name = selected.index_thread_name
+            elif _valid_existing_index_name(existing_entry, thread_id):
+                thread_name = str(existing_entry["thread_name"])
+            elif "title" in row.keys() and row["title"]:
+                thread_name = str(row["title"])
+            else:
+                thread_name = thread_id
+
+            if selected.index_updated_at:
+                updated_at = selected.index_updated_at
+            elif selected.codex_updated_at:
+                updated_at = selected.codex_updated_at
+            else:
+                db_updated_at = (
+                    int(row["updated_at"])
+                    if "updated_at" in row.keys() and row["updated_at"]
+                    else 0
+                )
+                updated_at = iso_utc_from_unix(db_updated_at)
+            merged.append(
+                {
+                    "id": thread_id,
+                    "thread_name": thread_name,
+                    "updated_at": updated_at,
+                }
+            )
+            continue
+
+        if existing_entry is not None:
+            merged.append(existing_entry)
+        elif not archived:
+            title = (
+                str(row["title"])
+                if "title" in row.keys() and row["title"]
+                else thread_id
+            )
+            updated_at = (
+                int(row["updated_at"])
+                if "updated_at" in row.keys() and row["updated_at"]
+                else 0
+            )
+            merged.append(
+                {
+                    "id": thread_id,
+                    "thread_name": title,
+                    "updated_at": iso_utc_from_unix(updated_at),
+                }
+            )
+
+    for thread_id, entry in existing_entries.items():
+        if thread_id not in db_ids:
+            merged.append(entry)
+
+    merged.sort(key=lambda item: (parse_index_timestamp(item["updated_at"]), item["id"]))
+    write_session_index(paths, merged)
+    return {
+        "rewritten_index_entries": len(merged),
+        "missing_session_index_entries_before": len(db_ids - set(existing_entries)),
+        "preserved_index_only_entries": len(set(existing_entries) - db_ids),
+    }
 
 
 def verify_restored_history(
@@ -412,10 +566,12 @@ def verify_restored_history(
 def restore_text_history(
     paths: Paths,
     entries: list[PreparedTextRestore],
+    *,
+    reconcile_existing_thread_metadata: bool = False,
 ) -> LocalRestoreSummary:
     ensure_environment(paths)
     if not entries:
-        return LocalRestoreSummary(0, 0, 0, 0, 0, 0, 0, None)
+        return LocalRestoreSummary(0, 0, 0, 0, 0, 0, 0, 0, None)
 
     target_cwds = {
         entry.codex_thread_id: entry.target_cwd.expanduser().resolve(strict=False)
@@ -439,17 +595,34 @@ def restore_text_history(
             raise RuntimeError("Target Codex database has an unsupported threads table")
         column_names = get_thread_columns(conn)
         sandbox_policy, approval_mode = compatibility_values(conn, column_names)
+        existing_select = [
+            name
+            for name in (
+                "id",
+                "rollout_path",
+                "cwd",
+                "title",
+                "source",
+                "archived",
+                "created_at",
+                "updated_at",
+                "created_at_ms",
+                "updated_at_ms",
+                "model_provider",
+                "model",
+                "thread_source",
+                "history_mode",
+            )
+            if name in column_names
+        ]
         existing_rows = {
             str(row["id"]): row
-            for row in conn.execute(
-                "SELECT id"
-                + (", rollout_path" if "rollout_path" in column_names else "")
-                + " FROM threads"
-            )
+            for row in conn.execute(f"SELECT {', '.join(existing_select)} FROM threads")
         }
 
     seen_paths: dict[Path, str] = {}
     insert_rows: list[dict[str, object]] = []
+    update_rows: list[tuple[str, dict[str, object]]] = []
     files_to_create: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
     files_to_replace: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
     existing_sessions = 0
@@ -509,7 +682,11 @@ def restore_text_history(
 
         existing = existing_rows.get(entry.codex_thread_id)
         if existing is not None:
-            if "rollout_path" in column_names and existing["rollout_path"]:
+            if (
+                not reconcile_existing_thread_metadata
+                and "rollout_path" in column_names
+                and existing["rollout_path"]
+            ):
                 existing_path = Path(str(existing["rollout_path"]))
                 try:
                     same_path = canonical_comparison_path(
@@ -522,6 +699,22 @@ def restore_text_history(
                     raise RuntimeError(
                         f"Existing Thread {entry.codex_thread_id} points to a different Session"
                     )
+            if reconcile_existing_thread_metadata:
+                candidate_values = build_reconcile_thread_values(
+                    entry,
+                    target,
+                    target_cwd,
+                    current_provider,
+                    current_model,
+                    payload,
+                )
+                changed_values = {
+                    name: value
+                    for name, value in candidate_values.items()
+                    if name in column_names and existing[name] != value
+                }
+                if changed_values:
+                    update_rows.append((entry.codex_thread_id, changed_values))
             continue
 
         values = build_thread_values(
@@ -538,13 +731,15 @@ def restore_text_history(
         insert_rows.append(values)
 
     index_before = read_session_index(paths)
-    needs_index_rebuild = any(
-        not entry.archived and entry.codex_thread_id not in index_before for entry in entries
+    needs_index_rebuild = reconcile_existing_thread_metadata or any(
+        not entry.archived and entry.codex_thread_id not in index_before
+        for entry in entries
     )
     has_mutations = bool(
         files_to_create
         or files_to_replace
         or insert_rows
+        or update_rows
         or needs_index_rebuild
     )
     if not has_mutations:
@@ -552,6 +747,7 @@ def restore_text_history(
         return LocalRestoreSummary(
             selected_threads=len(entries),
             inserted_threads=0,
+            reconciled_threads=0,
             created_sessions=0,
             existing_sessions=existing_sessions,
             verified_threads=verified_threads,
@@ -606,7 +802,7 @@ def restore_text_history(
                         f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
                     )
 
-            insert_threads_with_retry(paths, insert_rows, columns)
+            apply_thread_changes_with_retry(paths, insert_rows, update_rows, columns)
             update_provider_assignments(paths, current_provider, current_model)
             sync_session_records(paths, current_provider, current_model)
             for target, content, content_path, entry in files_to_replace:
@@ -627,7 +823,7 @@ def restore_text_history(
                         f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
                     )
             with connect_db(paths.db_path, readonly=True) as conn:
-                index_summary = rebuild_session_index(paths, conn)
+                index_summary = rebuild_restored_session_index(paths, conn, entries)
             verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
         except Exception as exc:
             rollback_error: Exception | None = None
@@ -651,6 +847,7 @@ def restore_text_history(
     return LocalRestoreSummary(
         selected_threads=len(entries),
         inserted_threads=len(insert_rows),
+        reconciled_threads=len(update_rows),
         created_sessions=len(created_files),
         existing_sessions=existing_sessions,
         verified_threads=verified_threads,

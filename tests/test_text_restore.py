@@ -12,7 +12,13 @@ from codex_sync.cloud.restore import SupabaseRestoreRepository
 from codex_sync.cloud.supabase_client import HttpResponse, SupabaseClient
 from codex_sync.config import SupabaseConfig
 from codex_sync.hashing import sha256_bytes, sha256_file
-from codex_sync.local.repair_engine import get_status, read_session_index, resolve_paths
+from codex_sync.local.repair_engine import (
+    get_status,
+    read_session_index,
+    resolve_paths,
+    write_session_index,
+)
+from codex_sync.local.thread_diagnose import diagnose_thread
 from codex_sync.models import AuthSession, DeviceIdentity
 from codex_sync.sync.download import (
     ManualDownloadEngine,
@@ -97,7 +103,10 @@ class MemoryCloudRepository:
                 "archived": item.archived,
                 "codex_created_at": item.codex_created_at,
                 "codex_updated_at": item.codex_updated_at,
-                "metadata": {},
+                "metadata": {
+                    "index_thread_name": item.index_thread_name,
+                    "index_updated_at": item.index_updated_at,
+                },
             }
         return mapping
 
@@ -349,6 +358,413 @@ def write_conflicting_session(
 
 
 class TextRestoreTests(unittest.TestCase):
+    def test_ordinary_restore_does_not_overwrite_existing_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            write_session_index(
+                resolve_paths(str(source)),
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Cloud index title",
+                        "updated_at": "2026-08-21T12:34:56Z",
+                    }
+                ],
+            )
+            repository = upload_test_computer_a(source)
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            paths = resolve_paths(str(target))
+            write_session_index(
+                paths,
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Local index title",
+                        "updated_at": "2026-08-22T00:00:00Z",
+                    }
+                ],
+            )
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET title = 'Local DB title',
+                        source = 'local-source',
+                        cwd = 'C:\\LocalOnly',
+                        thread_source = 'local-thread-source',
+                        history_mode = 'local-history'
+                    WHERE id = ?
+                    """,
+                    (ACTIVE_THREAD_ID,),
+                )
+                conn.commit()
+
+            summary = ManualDownloadEngine(
+                paths,
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(codex_thread_id=ACTIVE_THREAD_ID, target_cwd=root)
+
+            self.assertEqual(summary.local_restore.reconciled_threads, 0)
+            self.assertIsNone(summary.local_restore.safety_backup)
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                row = conn.execute(
+                    """
+                    SELECT title, source, cwd, thread_source, history_mode
+                    FROM threads WHERE id = ?
+                    """,
+                    (ACTIVE_THREAD_ID,),
+                ).fetchone()
+            self.assertEqual(
+                row,
+                (
+                    "Local DB title",
+                    "local-source",
+                    r"C:\LocalOnly",
+                    "local-thread-source",
+                    "local-history",
+                ),
+            )
+            self.assertEqual(
+                read_session_index(paths)[ACTIVE_THREAD_ID]["thread_name"],
+                "Local index title",
+            )
+
+    def test_explicit_reconcile_repairs_existing_metadata_and_selected_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            desired_index_name = "Codex 通用名 API 管理中心==最终完整部署任务……"
+            desired_index_updated = "2026-08-21T12:36:44Z"
+            write_session_index(
+                resolve_paths(str(source)),
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": desired_index_name,
+                        "updated_at": desired_index_updated,
+                    }
+                ],
+            )
+            repository = upload_test_computer_a(source)
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            paths = resolve_paths(str(target))
+            workspace = root / "MappedWorkspace"
+            workspace.mkdir()
+            local_only_id = "33333333-3333-4333-8333-333333333333"
+            local_only_session = (
+                target
+                / "sessions"
+                / "2026"
+                / "08"
+                / "22"
+                / f"rollout-2026-08-22T00-00-00-{local_only_id}.jsonl"
+            )
+            local_only_session.parent.mkdir(parents=True)
+            local_only_session.write_text(
+                json.dumps(
+                    {
+                        "type": "session_meta",
+                        "payload": {
+                            "id": local_only_id,
+                            "model_provider": "openai",
+                            "model": "gpt-source",
+                            "cwd": str(workspace),
+                            "source": "desktop",
+                            "thread_source": "user",
+                            "history_mode": "legacy",
+                        },
+                    },
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                conn.execute(
+                    """
+                    UPDATE threads
+                    SET rollout_path = 'C:\\Broken\\missing.jsonl',
+                        title = 'Stale DB title',
+                        source = 'stale-source',
+                        archived = 1,
+                        cwd = 'C:\\Stale',
+                        created_at = 1,
+                        updated_at = 2,
+                        created_at_ms = 1000,
+                        updated_at_ms = 2000,
+                        thread_source = 'stale-thread-source',
+                        history_mode = 'stale-history'
+                    WHERE id = ?
+                    """,
+                    (ACTIVE_THREAD_ID,),
+                )
+                conn.execute(
+                    """
+                    UPDATE threads SET archived = 0, cwd = 'C:\\Stale'
+                    WHERE id = ?
+                    """,
+                    (ARCHIVED_THREAD_ID,),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO threads (
+                        id, rollout_path, created_at, updated_at, source,
+                        model_provider, cwd, title, sandbox_policy, approval_mode,
+                        archived, model, created_at_ms, updated_at_ms,
+                        thread_source, history_mode
+                    ) VALUES (?, ?, 1700001000, 1700001010, 'desktop', 'openai', ?,
+                              'Local-only title', '{"type":"disabled"}', 'never',
+                              0, 'gpt-source', 1700001000000, 1700001010000,
+                              'user', 'legacy')
+                    """,
+                    (local_only_id, str(local_only_session), str(workspace)),
+                )
+                conn.commit()
+            local_only_index = {
+                "id": local_only_id,
+                "thread_name": "Local-only exact index",
+                "updated_at": "2026-08-22T01:02:03Z",
+            }
+            write_session_index(
+                paths,
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Stale restored title",
+                        "updated_at": "2026-08-20T00:00:00Z",
+                    },
+                    {
+                        "id": ARCHIVED_THREAD_ID,
+                        "thread_name": "Incorrect active archived entry",
+                        "updated_at": "2026-08-20T00:00:00Z",
+                    },
+                    local_only_index,
+                ],
+            )
+
+            first = ManualDownloadEngine(
+                paths,
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=workspace,
+                reconcile_existing_thread_metadata=True,
+            )
+
+            self.assertEqual(first.local_restore.reconciled_threads, 2)
+            self.assertIsNotNone(first.local_restore.safety_backup)
+            with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
+                row = conn.execute(
+                    """
+                    SELECT rollout_path, title, source, archived, cwd,
+                           created_at, updated_at, created_at_ms, updated_at_ms,
+                           model_provider, model, thread_source, history_mode,
+                           sandbox_policy, approval_mode
+                    FROM threads WHERE id = ?
+                    """,
+                    (ACTIVE_THREAD_ID,),
+                ).fetchone()
+                local_only_row = conn.execute(
+                    "SELECT title, cwd FROM threads WHERE id = ?",
+                    (local_only_id,),
+                ).fetchone()
+                integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+            self.assertEqual(Path(row[0]).parent.name, "21")
+            self.assertEqual(row[1:13], (
+                "Thread 1",
+                "vscode",
+                0,
+                str(workspace),
+                1700000000,
+                1700000010,
+                1700000000000,
+                1700000010000,
+                "openai",
+                "gpt-source",
+                "user",
+                "legacy",
+            ))
+            self.assertEqual(row[13], '{"type":"disabled"}')
+            self.assertEqual(row[14], "never")
+            self.assertEqual(local_only_row, ("Local-only title", str(workspace)))
+            self.assertEqual(integrity, "ok")
+
+            index = read_session_index(paths)
+            self.assertEqual(index[ACTIVE_THREAD_ID]["thread_name"], desired_index_name)
+            self.assertEqual(index[ACTIVE_THREAD_ID]["updated_at"], desired_index_updated)
+            self.assertNotIn(ARCHIVED_THREAD_ID, index)
+            self.assertEqual(index[local_only_id], local_only_index)
+
+            retry = ManualDownloadEngine(
+                paths,
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                target_cwd=workspace,
+                reconcile_existing_thread_metadata=True,
+            )
+            self.assertEqual(retry.local_restore.reconciled_threads, 0)
+            self.assertEqual(
+                read_session_index(paths)[ACTIVE_THREAD_ID]["thread_name"],
+                desired_index_name,
+            )
+
+    def test_legacy_cloud_without_index_metadata_preserves_valid_local_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            repository.threads[ACTIVE_THREAD_ID]["metadata"] = {}
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            paths = resolve_paths(str(target))
+            write_session_index(
+                paths,
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Valid legacy local index",
+                        "updated_at": "2026-08-20T00:00:00Z",
+                    }
+                ],
+            )
+
+            ManualDownloadEngine(
+                paths,
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                codex_thread_id=ACTIVE_THREAD_ID,
+                target_cwd=root,
+                reconcile_existing_thread_metadata=True,
+            )
+
+            self.assertEqual(
+                read_session_index(paths)[ACTIVE_THREAD_ID]["thread_name"],
+                "Valid legacy local index",
+            )
+
+    def test_cloud_null_index_metadata_preserves_valid_local_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_modern_codex_home(
+                root,
+                "TestComputerA",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            repository = upload_test_computer_a(source)
+            repository.threads[ACTIVE_THREAD_ID]["metadata"] = {
+                "index_thread_name": None,
+                "index_updated_at": None,
+            }
+            target = create_modern_codex_home(
+                root,
+                "TestComputerB",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            paths = resolve_paths(str(target))
+            write_session_index(
+                paths,
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Valid null-metadata local index",
+                        "updated_at": "2026-08-20T00:00:00Z",
+                    }
+                ],
+            )
+
+            ManualDownloadEngine(
+                paths,
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore(
+                codex_thread_id=ACTIVE_THREAD_ID,
+                target_cwd=root,
+                reconcile_existing_thread_metadata=True,
+            )
+
+            self.assertEqual(
+                read_session_index(paths)[ACTIVE_THREAD_ID]["thread_name"],
+                "Valid null-metadata local index",
+            )
+
+    def test_thread_diagnose_reads_only_requested_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = create_modern_codex_home(
+                Path(temp_dir),
+                "DiagnosticComputer",
+                provider="openai",
+                model="gpt-source",
+                populated=True,
+            )
+            paths = resolve_paths(str(codex_home))
+            write_session_index(
+                paths,
+                [
+                    {
+                        "id": ACTIVE_THREAD_ID,
+                        "thread_name": "Diagnostic index",
+                        "updated_at": "2026-08-21T00:00:00Z",
+                    }
+                ],
+            )
+
+            payload = diagnose_thread(paths, ACTIVE_THREAD_ID)
+
+            self.assertEqual(payload["thread_id"], ACTIVE_THREAD_ID)
+            self.assertEqual(payload["database"]["title"], "Thread 1")
+            self.assertEqual(payload["session_index"]["thread_name"], "Diagnostic index")
+            self.assertEqual(payload["session_meta"]["id"], ACTIVE_THREAD_ID)
+            self.assertEqual(payload["session_meta"]["source"], "vscode")
+            self.assertNotIn("content", payload["session_meta"])
+
     def test_computer_a_cloud_computer_b_restore_and_missing_only_rerun(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

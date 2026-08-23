@@ -2,6 +2,13 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.1-rc7] - 2026-08-23
+
+- 云端 Thread 元数据独立保存真实 `session_index` 名称和更新时间。
+- 完整恢复可显式修正已存在 Thread 的可见性元数据并精确重建所选索引。
+- 增加只读 `thread-diagnose`，用于对比数据库、索引和首行 Session metadata。
+- 保持 Attachment、Chunked Transport、Workspace Schema 和 Storage 布局不变。
+
 ## [2.0.1-rc6] - 2026-08-23
 
 - 修复 Attachment stale-reference 预校验将 Chunked Session Manifest 当作完整 JSONL 下载的问题。

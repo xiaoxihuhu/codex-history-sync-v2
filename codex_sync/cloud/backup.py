@@ -67,7 +67,10 @@ class SupabaseManualUploadRepository:
                 "archived": item.archived,
                 "codex_created_at": item.codex_created_at,
                 "codex_updated_at": item.codex_updated_at,
-                "metadata": {},
+                "metadata": {
+                    "index_thread_name": item.index_thread_name,
+                    "index_updated_at": item.index_updated_at,
+                },
             }
             for item in threads
         ]

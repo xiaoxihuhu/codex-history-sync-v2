@@ -126,6 +126,7 @@ class ManualDownloadEngine:
         workspace_id: str | None = None,
         target_cwd: Path | None = None,
         replace_conflicting_sessions: bool = False,
+        reconcile_existing_thread_metadata: bool = False,
     ) -> ManualDownloadSummary:
         ensure_environment(self.paths)
         session = self.auth.restore_session()
@@ -237,6 +238,8 @@ class ManualDownloadEngine:
             for thread in threads:
                 cloud_thread_id = required_text(thread, "id", "Thread")
                 local_thread_id = required_text(thread, "codex_thread_id", "Thread")
+                raw_metadata = thread.get("metadata")
+                metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
                 cloud_session = choose_session(thread, sessions)
                 relative_path = required_text(cloud_session, "relative_path", "Session")
                 content_hash = required_text(cloud_session, "content_hash", "Session")
@@ -335,12 +338,26 @@ class ManualDownloadEngine:
                             else None
                         ),
                         target_cwd=target_cwds[local_thread_id],
+                        index_thread_name=(
+                            str(metadata["index_thread_name"])
+                            if metadata.get("index_thread_name")
+                            else None
+                        ),
+                        index_updated_at=(
+                            str(metadata["index_updated_at"])
+                            if metadata.get("index_updated_at")
+                            else None
+                        ),
                         content_path=content_path,
                         replace_existing=replace_existing,
                     )
                 )
 
-            local_summary = restore_text_history(self.paths, prepared)
+            local_summary = restore_text_history(
+                self.paths,
+                prepared,
+                reconcile_existing_thread_metadata=reconcile_existing_thread_metadata,
+            )
 
         return ManualDownloadSummary(
             cloud_threads=len(threads),

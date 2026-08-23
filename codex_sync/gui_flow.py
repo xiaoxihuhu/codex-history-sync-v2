@@ -231,7 +231,11 @@ def run_full_restore(
     update("history", "进行中", "恢复 Thread 和 Session")
     history_restore = command(
         "history",
-        ["cloud-restore", "--replace-conflicting-sessions"],
+        [
+            "cloud-restore",
+            "--replace-conflicting-sessions",
+            "--reconcile-existing-thread-metadata",
+        ],
     )
     update("history", "成功", "Thread 和 Session 恢复完成")
 

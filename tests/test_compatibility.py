@@ -24,6 +24,7 @@ class CompatibilityTests(unittest.TestCase):
             "restore",
             "backup",
             "probe-attachments",
+            "thread-diagnose",
             "cloud-configure",
             "auth-sign-up",
             "auth-sign-in",
@@ -44,6 +45,8 @@ class CompatibilityTests(unittest.TestCase):
             command_args = [command]
             if command == "cloud-configure":
                 command_args += ["--url", "https://example.supabase.co"]
+            elif command == "thread-diagnose":
+                command_args += ["--thread-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
             elif command in {"auth-sign-up", "auth-sign-in"}:
                 command_args += ["--email", "user@example.com"]
             elif command == "cloud-snapshot-restore":
@@ -60,6 +63,15 @@ class CompatibilityTests(unittest.TestCase):
             ["cloud-restore", "--replace-conflicting-sessions"]
         )
         self.assertTrue(args.replace_conflicting_sessions)
+        self.assertFalse(args.reconcile_existing_thread_metadata)
+        reconcile_args = parser.parse_args(
+            [
+                "cloud-restore",
+                "--replace-conflicting-sessions",
+                "--reconcile-existing-thread-metadata",
+            ]
+        )
+        self.assertTrue(reconcile_args.reconcile_existing_thread_metadata)
 
         snapshot_args = parser.parse_args(
             [
@@ -70,6 +82,7 @@ class CompatibilityTests(unittest.TestCase):
             ]
         )
         self.assertTrue(snapshot_args.replace_conflicting_sessions)
+        self.assertFalse(snapshot_args.reconcile_existing_thread_metadata)
 
 
 if __name__ == "__main__":

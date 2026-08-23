@@ -253,7 +253,11 @@ class GuiFlowTests(unittest.TestCase):
         )
         self.assertEqual(
             runner.arguments[4],
-            ["cloud-restore", "--replace-conflicting-sessions"],
+            [
+                "cloud-restore",
+                "--replace-conflicting-sessions",
+                "--reconcile-existing-thread-metadata",
+            ],
         )
         self.assertEqual(result.final_status["total_threads"], 33)
 

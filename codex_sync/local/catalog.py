@@ -8,7 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from codex_sync.hashing import sha256_bytes, sha256_file
-from codex_sync.local.repair_engine import Paths, connect_db, get_thread_columns
+from codex_sync.local.repair_engine import (
+    Paths,
+    connect_db,
+    get_thread_columns,
+    read_session_index,
+)
 
 UTC = timezone.utc
 ALLOWED_SESSION_ROOTS = {"sessions", "archived_sessions"}
@@ -35,6 +40,8 @@ class LocalThreadRecord:
     archived: bool
     codex_created_at: str | None
     codex_updated_at: str | None
+    index_thread_name: str | None
+    index_updated_at: str | None
     rollout_relative_path: str
     session: LocalSessionAsset
 
@@ -108,6 +115,7 @@ def read_session_id(path: Path, fallback_thread_id: str) -> str:
 
 
 def scan_local_catalog(paths: Paths) -> list[LocalThreadRecord]:
+    index_entries = read_session_index(paths)
     with connect_db(paths.db_path, readonly=True) as conn:
         columns = get_thread_columns(conn)
         required = {"id", "rollout_path", "model_provider"}
@@ -176,6 +184,16 @@ def scan_local_catalog(paths: Paths) -> list[LocalThreadRecord]:
                     if updated_ms
                     else unix_timestamp_to_iso(row["updated_at"])
                     if "updated_at" in selected
+                    else None
+                ),
+                index_thread_name=(
+                    str(index_entries[thread_id]["thread_name"])
+                    if thread_id in index_entries
+                    else None
+                ),
+                index_updated_at=(
+                    str(index_entries[thread_id]["updated_at"])
+                    if thread_id in index_entries
                     else None
                 ),
                 rollout_relative_path=relative_path,

@@ -1385,7 +1385,11 @@ if PYSIDE6_AVAILABLE:
                 (
                     "history",
                     "恢复 Thread 和 Session",
-                    ["cloud-restore", "--replace-conflicting-sessions"],
+                    [
+                        "cloud-restore",
+                        "--replace-conflicting-sessions",
+                        "--reconcile-existing-thread-metadata",
+                    ],
                     "Thread 和 Session 恢复完成",
                     "history_restore",
                 ),

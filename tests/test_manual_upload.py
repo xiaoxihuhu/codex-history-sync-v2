@@ -238,6 +238,31 @@ class ManualUploadTests(unittest.TestCase):
             self.assertEqual(devices.register_calls, 3)
             self.assertEqual(devices.backup_calls, 3)
 
+    def test_catalog_keeps_db_title_and_index_name_as_independent_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            codex_home = create_codex_home(Path(temp_dir))
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "thread-1",
+                        "thread_name": "shopyy���",
+                        "updated_at": "2026-08-23T01:02:03Z",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            records = scan_local_catalog(resolve_paths(str(codex_home)))
+
+            self.assertEqual(records[0].title, "Thread 1")
+            self.assertEqual(records[0].index_thread_name, "shopyy���")
+            self.assertEqual(records[0].index_updated_at, "2026-08-23T01:02:03Z")
+            self.assertIsNone(records[1].index_thread_name)
+            self.assertIsNone(records[1].index_updated_at)
+
     def test_catalog_rejects_rollout_outside_codex_home(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -281,6 +306,11 @@ class SupabaseUploadRepositoryTests(unittest.TestCase):
     def test_v2_rest_and_storage_request_contract(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             paths = resolve_paths(str(create_codex_home(Path(temp_dir))))
+            (paths.codex_home / "session_index.jsonl").write_text(
+                '{"id":"thread-1","thread_name":"Independent index title",'
+                '"updated_at":"2026-08-23T01:02:03Z"}\n',
+                encoding="utf-8",
+            )
             threads = scan_local_catalog(paths)
             stable = read_stable_file(threads[0].session.path)
             user_id = auth_session().user.id
@@ -337,6 +367,24 @@ class SupabaseUploadRepositoryTests(unittest.TestCase):
             thread_payload = json.loads(thread_request["body"].decode("utf-8"))
             self.assertIn("on_conflict=user_id%2Ccodex_thread_id", thread_request["url"])
             self.assertNotIn(str(paths.codex_home), json.dumps(thread_payload))
+            metadata_by_id = {
+                item["codex_thread_id"]: item["metadata"]
+                for item in thread_payload
+            }
+            self.assertEqual(
+                metadata_by_id["thread-1"],
+                {
+                    "index_thread_name": "Independent index title",
+                    "index_updated_at": "2026-08-23T01:02:03Z",
+                },
+            )
+            self.assertEqual(
+                metadata_by_id["thread-2"],
+                {
+                    "index_thread_name": None,
+                    "index_updated_at": None,
+                },
+            )
 
             storage_request = transport.requests[2]
             self.assertIn(

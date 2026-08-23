@@ -35,6 +35,7 @@ from codex_sync.local.repair_engine import (
     restore_backup,
     sync_to_current_provider,
 )
+from codex_sync.local.thread_diagnose import diagnose_thread
 from codex_sync.progress import emit_progress
 from codex_sync.sync import SyncStateStore
 from codex_sync.sync.download import ManualDownloadEngine
@@ -75,6 +76,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip archived session files",
     )
+    diagnose_parser = subparsers.add_parser(
+        "thread-diagnose",
+        help="Read one Thread's database, index, and first-line Session metadata",
+    )
+    diagnose_parser.add_argument("--thread-id", required=True)
     configure_parser = subparsers.add_parser(
         "cloud-configure",
         help="Save the Supabase project URL and client-safe publishable/anon key",
@@ -116,6 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow full recovery to replace same-path Sessions whose SHA256 differs",
     )
+    restore_cloud_parser.add_argument(
+        "--reconcile-existing-thread-metadata",
+        action="store_true",
+        help="Reconcile selected existing Thread metadata from cloud and Session metadata",
+    )
     snapshot_restore_parser = subparsers.add_parser(
         "cloud-snapshot-restore",
         help="Restore plain-text history from a selected cloud Snapshot",
@@ -128,6 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--replace-conflicting-sessions",
         action="store_true",
         help="Allow full recovery to replace same-path Sessions whose SHA256 differs",
+    )
+    snapshot_restore_parser.add_argument(
+        "--reconcile-existing-thread-metadata",
+        action="store_true",
+        help="Reconcile selected existing Thread metadata from the Snapshot",
     )
     subparsers.add_parser(
         "workspace-list",
@@ -180,6 +196,8 @@ def main() -> int:
                 paths.codex_home,
                 include_archived=not args.active_only,
             ).to_dict()
+        elif args.command == "thread-diagnose":
+            payload = diagnose_thread(paths, args.thread_id)
         elif args.command == "cloud-configure":
             public_key = getpass.getpass("Supabase publishable/anon key: ")
             app_paths = default_app_paths()
@@ -342,6 +360,9 @@ def main() -> int:
                         workspace_id=args.workspace_id,
                         target_cwd=Path(args.target_cwd) if args.target_cwd else None,
                         replace_conflicting_sessions=args.replace_conflicting_sessions,
+                        reconcile_existing_thread_metadata=(
+                            args.reconcile_existing_thread_metadata
+                        ),
                     )
                     payload = {
                         "action": "cloud-restore",
@@ -374,6 +395,9 @@ def main() -> int:
                         workspace_id=args.workspace_id,
                         target_cwd=Path(args.target_cwd) if args.target_cwd else None,
                         replace_conflicting_sessions=args.replace_conflicting_sessions,
+                        reconcile_existing_thread_metadata=(
+                            args.reconcile_existing_thread_metadata
+                        ),
                     )
                     payload = {
                         "action": "cloud-snapshot-restore",
