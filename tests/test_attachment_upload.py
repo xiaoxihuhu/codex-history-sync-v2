@@ -171,6 +171,15 @@ class MemoryAttachmentRepository:
             output.append(stored)
         return output
 
+    def delete_references(self, user_id, reference_ids, access_token):
+        wanted = {str(value) for value in reference_ids}
+        deleted = 0
+        for key, row in list(self.references.items()):
+            if str(row.get("id") or "") in wanted and str(row.get("user_id") or "") == user_id:
+                del self.references[key]
+                deleted += 1
+        return deleted
+
 
 class RecordingTransport:
     def __init__(self, responses: list[HttpResponse]) -> None:
@@ -351,6 +360,108 @@ def prepare_cloud_session_manifest(
             "codex_updated_at": None,
         }
     )
+    repository.session_rows[0].update(
+        {
+            "content_hash": digest,
+            "file_size": len(content),
+            "storage_path": storage_path,
+        }
+    )
+
+
+def create_two_attachment_home(root: Path) -> Path:
+    codex_home = root / ".codex"
+    codex_home.mkdir(parents=True)
+    attachments_dir = codex_home / "attachments"
+    attachment_a = attachments_dir / "a" / "a.txt"
+    attachment_b = attachments_dir / "b" / "b.txt"
+    attachment_a.parent.mkdir(parents=True)
+    attachment_b.parent.mkdir(parents=True)
+    attachment_a.write_text("attachment A\n", encoding="utf-8")
+    attachment_b.write_text("attachment B\n", encoding="utf-8")
+    write_two_attachment_session(codex_home, include_a=True, include_b=True)
+    return codex_home
+
+
+def write_two_attachment_session(
+    codex_home: Path,
+    *,
+    include_a: bool,
+    include_b: bool,
+) -> None:
+    session_path = (
+        codex_home / "sessions" / "2026" / "08" / "21"
+        / "rollout-attachment-fixture.jsonl"
+    )
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    paths = {
+        "a": codex_home / "attachments" / "a" / "a.txt",
+        "b": codex_home / "attachments" / "b" / "b.txt",
+    }
+    content_a = (
+        [
+            {
+                "type": "input_file",
+                "file_path": str(paths["a"]),
+            }
+        ]
+        if include_a
+        else []
+    )
+    content_b = (
+        [
+            {
+                "type": "input_file",
+                "file_path": str(paths["b"]),
+            }
+        ]
+        if include_b
+        else []
+    )
+    items = [
+        {
+            "type": "session_meta",
+            "payload": {
+                "id": THREAD_ID,
+                "session_id": SESSION_ID,
+                "model_provider": "openai",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": content_a,
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": content_b,
+            },
+        },
+    ]
+    session_path.write_text(
+        "\n".join(json.dumps(item, separators=(",", ":")) for item in items) + "\n",
+        encoding="utf-8",
+    )
+
+
+def prepare_two_attachment_cloud_session(
+    repository: MemoryAttachmentRepository,
+    source_home: Path,
+) -> None:
+    session_path = (
+        source_home / "sessions" / "2026" / "08" / "21"
+        / "rollout-attachment-fixture.jsonl"
+    )
+    content = session_path.read_bytes()
+    digest = sha256_bytes(content)
+    storage_path = f"users/{USER_ID}/sessions/{digest}.jsonl"
+    repository.objects[storage_path] = content
     repository.session_rows[0].update(
         {
             "content_hash": digest,
@@ -583,6 +694,94 @@ class AttachmentUploadTests(unittest.TestCase):
             self.assertEqual(probe["summary"]["unique_content_hashes"], 34)
             self.assertEqual(probe["summary"]["missing"], 0)
 
+    def test_reconciles_stale_cloud_references_and_skips_them_during_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = create_two_attachment_home(root / "TestComputerA")
+            repository = MemoryAttachmentRepository()
+            source_paths = {
+                "a": source / "attachments" / "a" / "a.txt",
+                "b": source / "attachments" / "b" / "b.txt",
+            }
+            engine = AttachmentUploadEngine(
+                resolve_paths(str(source)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            )
+
+            first = engine.upload()
+            self.assertEqual(first.stale_references_removed, 0)
+            self.assertEqual(len(repository.references), 2)
+            stale_row = next(
+                dict(row)
+                for row in repository.references.values()
+                if row.get("original_local_path") == str(source_paths["a"])
+            )
+
+            write_two_attachment_session(source, include_a=False, include_b=True)
+            prepare_two_attachment_cloud_session(repository, source)
+            second = engine.upload()
+
+            self.assertEqual(second.stale_references_removed, 1)
+            self.assertEqual(len(repository.references), 1)
+            self.assertTrue(
+                all(
+                    row.get("original_local_path") == str(source_paths["b"])
+                    for row in repository.references.values()
+                )
+            )
+
+            stale_key = (
+                str(stale_row["attachment_id"]),
+                str(stale_row["reference_location"]),
+            )
+            repository.references[stale_key] = stale_row
+            valid_b_row = next(iter(repository.references.values()))
+            duplicate_b_row = dict(valid_b_row)
+            duplicate_b_row["id"] = "reference-duplicate-b"
+            duplicate_b_row["reference_location"] = (
+                "sessions/fixture.jsonl:duplicate-b"
+            )
+            repository.references[
+                (
+                    str(duplicate_b_row["attachment_id"]),
+                    str(duplicate_b_row["reference_location"]),
+                )
+            ] = duplicate_b_row
+
+            target = create_attachment_restore_target(root, source)
+            summary = AttachmentDownloadEngine(
+                resolve_paths(str(target)),
+                FakeAuth(),
+                FakeDevices(),
+                repository,
+            ).restore()
+
+            self.assertEqual(summary.stale_cloud_references_skipped, 1)
+            self.assertEqual(summary.local_restore.stale_cloud_references_skipped, 1)
+            self.assertEqual(summary.local_restore.rewritten_sessions, 1)
+            self.assertEqual(summary.local_restore.rewritten_references, 1)
+            self.assertEqual(summary.local_restore.verified_files, 2)
+            probe = probe_attachments(target).to_dict()
+            self.assertEqual(probe["summary"]["missing"], 0)
+            self.assertEqual(probe["summary"]["unique_content_hashes"], 1)
+            digest_b = next(
+                digest
+                for digest in repository.attachments
+                if repository.attachments[digest].get("original_local_path")
+                == str(source_paths["b"])
+            )
+            restored_b = next(
+                path
+                for path in (target / "restored_attachments").rglob("*")
+                if path.is_file() and path.name.startswith(digest_b)
+            )
+            self.assertEqual(
+                sha256_bytes(restored_b.read_bytes()),
+                digest_b,
+            )
+
     def test_attachment_session_write_failure_rolls_back_created_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -644,6 +843,7 @@ class SupabaseAttachmentRepositoryTests(unittest.TestCase):
                 json_response(200, {"Key": object_path}),
                 json_response(201, [{"id": "attachment-1", "sha256": digest}]),
                 json_response(201, [{"id": "reference-1"}]),
+                json_response(200, [{"id": "reference-1"}]),
             ]
         )
         repository = SupabaseAttachmentRepository(
@@ -697,6 +897,16 @@ class SupabaseAttachmentRepositoryTests(unittest.TestCase):
             "on_conflict=user_id%2Cattachment_id%2Creference_location",
             reference_request["url"],
         )
+        deleted = repository.delete_references(
+            USER_ID,
+            ["reference-1"],
+            "access-token",
+        )
+        self.assertEqual(deleted, 1)
+        delete_request = transport.requests[3]
+        self.assertEqual(delete_request["method"], "DELETE")
+        self.assertIn("user_id=eq.", delete_request["url"])
+        self.assertIn("id=in.", delete_request["url"])
 
 
 if __name__ == "__main__":

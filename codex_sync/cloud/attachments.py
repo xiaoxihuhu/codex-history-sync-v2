@@ -13,6 +13,8 @@ class AttachmentRepository(Protocol):
 
     def list_sessions(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
 
+    def download_session(self, storage_path: str, access_token: str) -> bytes: ...
+
     def list_attachments(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
 
     def list_references(self, user_id: str, access_token: str) -> list[dict[str, Any]]: ...
@@ -61,6 +63,13 @@ class AttachmentRepository(Protocol):
         access_token: str,
     ) -> list[dict[str, Any]]: ...
 
+    def delete_references(
+        self,
+        user_id: str,
+        reference_ids: list[str],
+        access_token: str,
+    ) -> int: ...
+
 
 class SupabaseAttachmentRepository:
     def __init__(self, client: SupabaseClient, storage: SupabaseStorage | None = None) -> None:
@@ -85,7 +94,10 @@ class SupabaseAttachmentRepository:
     def list_sessions(self, user_id: str, access_token: str) -> list[dict[str, Any]]:
         return self._list(
             "sessions",
-            "id,thread_id,codex_session_id,relative_path",
+            (
+                "id,thread_id,codex_session_id,relative_path,content_hash,file_size,"
+                "storage_path"
+            ),
             user_id,
             access_token,
         )
@@ -145,6 +157,9 @@ class SupabaseAttachmentRepository:
 
     def download_object(self, object_path: str, access_token: str) -> bytes:
         return self.storage.download(object_path, access_token=access_token)
+
+    def download_session(self, storage_path: str, access_token: str) -> bytes:
+        return self.storage.download(storage_path, access_token=access_token)
 
     def download_object_to_path(
         self,
@@ -223,3 +238,31 @@ class SupabaseAttachmentRepository:
         if not isinstance(response, list) or len(response) != len(rows):
             raise SupabaseError("Supabase Attachment reference upsert returned an incomplete response")
         return response
+
+    def delete_references(
+        self,
+        user_id: str,
+        reference_ids: list[str],
+        access_token: str,
+    ) -> int:
+        ids = sorted({str(value).strip() for value in reference_ids if str(value).strip()})
+        if not ids:
+            return 0
+        query = urlencode(
+            {
+                "user_id": f"eq.{user_id}",
+                "id": f"in.({','.join(ids)})",
+            }
+        )
+        response = self.client.request_json(
+            "DELETE",
+            f"/rest/v1/attachment_references?{query}",
+            access_token=access_token,
+            extra_headers={"Prefer": "return=representation"},
+            expected_statuses=(200, 204),
+        )
+        if response in ({}, None):
+            return 0
+        if not isinstance(response, list):
+            raise SupabaseError("Supabase Attachment reference delete returned an invalid response")
+        return len(response)

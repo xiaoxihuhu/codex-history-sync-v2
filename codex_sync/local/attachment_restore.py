@@ -36,6 +36,7 @@ class AttachmentRestoreSummary:
     rewritten_references: int
     verified_files: int
     safety_backup: str | None
+    stale_cloud_references_skipped: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -165,7 +166,9 @@ def restore_attachments_locally(
     paths: Paths,
     prepared: list[PreparedAttachmentRestore],
     cloud_sessions: list[dict[str, Any]],
+    stale_reference_ids: set[str] | None = None,
 ) -> AttachmentRestoreSummary:
+    stale_ids = stale_reference_ids or set()
     session_paths = {
         str(item["id"]): safe_restore_path(paths.codex_home, str(item["relative_path"]))
         for item in cloud_sessions
@@ -175,7 +178,7 @@ def restore_attachments_locally(
     files_to_create: list[tuple[Path, bytes | None, Path | None]] = []
     existing_files = 0
     replacements_by_session: dict[Path, dict[str, str]] = {}
-    expected_reference_rewrites = 0
+    expected_reference_rewrites: set[tuple[Path, str, str]] = set()
     manifest_path = paths.codex_home / "attachments" / "pasted-text-attachments.json"
     manifest_targets: list[str] = []
     manifest_replacements: dict[str, str] = {}
@@ -193,6 +196,8 @@ def restore_attachments_locally(
             files_to_create.append((target, item.content, item.content_path))
 
         for reference in item.references:
+            if str(reference.get("id") or "") in stale_ids:
+                continue
             session_id = str(reference.get("session_id") or "")
             original_path = str(reference.get("original_local_path") or "")
             reference_kind = str(reference.get("reference_kind") or "")
@@ -220,7 +225,9 @@ def restore_attachments_locally(
                 mapping = replacements_by_session.setdefault(session_path, {})
                 for variant in variants:
                     mapping[variant] = str(target)
-                expected_reference_rewrites += 1
+                expected_reference_rewrites.add(
+                    (session_path, original_path, str(target))
+                )
             elif not restored_count:
                 raise RuntimeError(
                     f"Attachment reference is missing from restored Session: {session_path}"
@@ -271,6 +278,7 @@ def restore_attachments_locally(
             rewritten_references=0,
             verified_files=len(prepared),
             safety_backup=None,
+            stale_cloud_references_skipped=len(stale_ids),
         )
 
     safety_backup = make_backup(paths, "pre-attachment-restore")
@@ -302,7 +310,7 @@ def restore_attachments_locally(
             if manifest_update and manifest_content is not None:
                 atomic_write_bytes(manifest_path, manifest_content)
 
-            if rewritten_references < expected_reference_rewrites:
+            if rewritten_references < len(expected_reference_rewrites):
                 raise RuntimeError("Not every Attachment path reference was rewritten")
             for item in prepared:
                 target = targets[item.attachment_id]
@@ -343,4 +351,5 @@ def restore_attachments_locally(
         rewritten_references=rewritten_references,
         verified_files=len(prepared),
         safety_backup=str(safety_backup),
+        stale_cloud_references_skipped=len(stale_ids),
     )

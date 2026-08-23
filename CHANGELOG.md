@@ -2,6 +2,14 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.1-rc5] - 2026-08-23
+
+- 修复云端 `attachment_references` 只 upsert、不收敛当前已扫描 Session 的残留引用问题。
+- 恢复时按准确云端 Session 内容识别并安全跳过 `stale_cloud_reference`。
+- 修复同一 Session 路径被多个 Reference location 复用时的改写计数误报。
+- 修复 Windows frozen internal CLI 输出完成后进程未及时退出的问题。
+- 保持 Attachment Storage 对象、数据库 Schema、RLS 和 Storage Policy 不变。
+
 ## [2.0.1-rc2] - 2026-08-22
 
 - 将 GUI 长任务改为同一 EXE 的隔离 QProcess internal CLI，增加即时状态、耗时和字节进度反馈。

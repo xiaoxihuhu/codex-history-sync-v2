@@ -315,6 +315,22 @@ class GuiTests(unittest.TestCase):
         result = next(item for item in lines if item.get("ok") is True)
         self.assertEqual(result["workspaces"][0]["name"], "shopyy���")
 
+    def test_frozen_internal_cli_exits_after_emitting_result(self) -> None:
+        import launch_gui
+
+        with (
+            mock.patch(
+                "launch_gui.sys.argv",
+                ["CodexHistorySync.exe", "--internal-cli", "--json", "queue-status"],
+            ),
+            mock.patch("launch_gui._internal_cli_main", return_value=0),
+            mock.patch.object(launch_gui.sys, "frozen", True, create=True),
+            mock.patch("launch_gui.os._exit") as exit_process,
+        ):
+            launch_gui.main()
+
+        exit_process.assert_called_once_with(0)
+
     def test_bulk_workspace_mapping_creates_safe_subdirectories(self) -> None:
         window, calls = self.window()
         window.refresh_workspaces = mock.Mock()  # type: ignore[method-assign]
