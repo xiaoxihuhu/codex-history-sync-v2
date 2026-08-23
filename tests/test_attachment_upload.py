@@ -138,6 +138,17 @@ class MemoryAttachmentRepository:
     def download_session(self, storage_path, access_token):
         return self.objects[storage_path]
 
+    def download_session_to_path(
+        self,
+        user_id,
+        storage_path,
+        destination,
+        expected_sha256,
+        expected_size,
+        access_token,
+    ):
+        Path(destination).write_bytes(self.objects[storage_path])
+
     def upsert_attachments(self, user_id, device_id, rows, access_token):
         mapping = {}
         for row in rows:

@@ -2,6 +2,12 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.1-rc6] - 2026-08-23
+
+- 修复 Attachment stale-reference 预校验将 Chunked Session Manifest 当作完整 JSONL 下载的问题。
+- 通过现有 transport-aware Session 下载重组 Legacy Manifest path 和 modern Manifest path。
+- 保持 Chunked Transport、数据库 Schema、RLS、Storage Policy 和 RC5 Attachment reconcile 行为不变。
+
 ## [2.0.1-rc5] - 2026-08-23
 
 - 修复云端 `attachment_references` 只 upsert、不收敛当前已扫描 Session 的残留引用问题。

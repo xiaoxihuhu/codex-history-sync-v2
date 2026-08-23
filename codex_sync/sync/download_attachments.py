@@ -9,7 +9,7 @@ from pathlib import Path
 from codex_sync.cloud.attachments import AttachmentRepository
 from codex_sync.cloud.auth import AuthService
 from codex_sync.cloud.devices import DeviceService
-from codex_sync.hashing import sha256_bytes, sha256_file
+from codex_sync.hashing import sha256_file
 from codex_sync.local.attachment_restore import (
     AttachmentRestoreSummary,
     PreparedAttachmentRestore,
@@ -54,11 +54,18 @@ class AttachmentDownloadEngine:
         self,
         references: list[dict[str, object]],
         cloud_sessions: list[dict[str, object]],
+        user_id: str,
         access_token: str,
     ) -> set[str]:
-        download_session = getattr(self.repository, "download_session", None)
-        if not callable(download_session):
-            return set()
+        download_session_to_path = getattr(
+            self.repository,
+            "download_session_to_path",
+            None,
+        )
+        if not callable(download_session_to_path):
+            raise RuntimeError(
+                "Attachment repository does not support transport-aware Session downloads"
+            )
 
         session_rows = {
             str(row.get("id") or ""): row
@@ -79,24 +86,15 @@ class AttachmentDownloadEngine:
             storage_path = str(session_row.get("storage_path") or "")
             if not storage_path:
                 continue
-            content = download_session(storage_path, access_token)
             expected_hash = str(session_row.get("content_hash") or "")
-            if expected_hash and sha256_bytes(content) != expected_hash:
+            if not SHA256_PATTERN.fullmatch(expected_hash):
+                raise RuntimeError(f"Cloud Session has invalid SHA256: {storage_path}")
+            try:
+                expected_size = int(session_row["file_size"])
+            except (KeyError, TypeError, ValueError) as exc:
                 raise RuntimeError(
-                    f"Cloud Session verification failed before Attachment restore: {storage_path}"
-                )
-            if session_row.get("file_size") is not None:
-                try:
-                    expected_size = int(session_row["file_size"])
-                except (TypeError, ValueError) as exc:
-                    raise RuntimeError(
-                        f"Cloud Session has invalid file_size: {storage_path}"
-                    ) from exc
-                if len(content) != expected_size:
-                    raise RuntimeError(
-                        f"Cloud Session size verification failed before Attachment restore: "
-                        f"{storage_path}"
-                    )
+                    f"Cloud Session has invalid file_size: {storage_path}"
+                ) from exc
 
             descriptor, temp_name = tempfile.mkstemp(
                 prefix="codex-sync-cloud-session-",
@@ -105,7 +103,24 @@ class AttachmentDownloadEngine:
             os.close(descriptor)
             temp_path = Path(temp_name)
             try:
-                temp_path.write_bytes(content)
+                download_session_to_path(
+                    user_id,
+                    storage_path,
+                    temp_path,
+                    expected_hash,
+                    expected_size,
+                    access_token,
+                )
+                if temp_path.stat().st_size != expected_size:
+                    raise RuntimeError(
+                        f"Cloud Session size verification failed before Attachment restore: "
+                        f"{storage_path}"
+                    )
+                if sha256_file(temp_path) != expected_hash:
+                    raise RuntimeError(
+                        f"Cloud Session verification failed before Attachment restore: "
+                        f"{storage_path}"
+                    )
                 for reference in session_references:
                     original_path = str(reference.get("original_local_path") or "")
                     if not original_path:
@@ -133,6 +148,7 @@ class AttachmentDownloadEngine:
         stale_reference_ids = self._stale_reference_ids(
             references,
             cloud_sessions,
+            session.user.id,
             session.access_token,
         )
         references_by_attachment: dict[str, list[dict[str, object]]] = {}
