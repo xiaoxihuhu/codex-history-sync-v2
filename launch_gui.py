@@ -93,7 +93,14 @@ def _internal_cli_main() -> int:
 
 def main() -> int:
     if "--internal-cli" in sys.argv:
-        return _internal_cli_main()
+        result = _internal_cli_main()
+        if getattr(sys, "frozen", False):
+            for stream in (getattr(sys, "stdout", None), getattr(sys, "stderr", None)):
+                flush = getattr(stream, "flush", None)
+                if callable(flush):
+                    flush()
+            os._exit(result)
+        return result
 
     from codex_sync.gui import main as gui_main
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import tempfile
 from dataclasses import asdict, dataclass
@@ -8,10 +9,12 @@ from pathlib import Path
 from codex_sync.cloud.attachments import AttachmentRepository
 from codex_sync.cloud.auth import AuthService
 from codex_sync.cloud.devices import DeviceService
-from codex_sync.hashing import sha256_file
+from codex_sync.hashing import sha256_bytes, sha256_file
 from codex_sync.local.attachment_restore import (
     AttachmentRestoreSummary,
     PreparedAttachmentRestore,
+    count_session_references,
+    replacement_variants,
     restore_attachments_locally,
     restored_attachment_path,
 )
@@ -26,6 +29,7 @@ class AttachmentDownloadSummary:
     downloaded_objects: int
     reused_local_objects: int
     local_restore: AttachmentRestoreSummary
+    stale_cloud_references_skipped: int = 0
 
     def to_dict(self) -> dict[str, object]:
         payload = asdict(self)
@@ -46,6 +50,77 @@ class AttachmentDownloadEngine:
         self.devices = devices
         self.repository = repository
 
+    def _stale_reference_ids(
+        self,
+        references: list[dict[str, object]],
+        cloud_sessions: list[dict[str, object]],
+        access_token: str,
+    ) -> set[str]:
+        download_session = getattr(self.repository, "download_session", None)
+        if not callable(download_session):
+            return set()
+
+        session_rows = {
+            str(row.get("id") or ""): row
+            for row in cloud_sessions
+            if row.get("id")
+        }
+        references_by_session: dict[str, list[dict[str, object]]] = {}
+        for reference in references:
+            session_id = str(reference.get("session_id") or "")
+            if session_id and reference.get("id"):
+                references_by_session.setdefault(session_id, []).append(reference)
+
+        stale_ids: set[str] = set()
+        for session_id, session_references in references_by_session.items():
+            session_row = session_rows.get(session_id)
+            if session_row is None:
+                continue
+            storage_path = str(session_row.get("storage_path") or "")
+            if not storage_path:
+                continue
+            content = download_session(storage_path, access_token)
+            expected_hash = str(session_row.get("content_hash") or "")
+            if expected_hash and sha256_bytes(content) != expected_hash:
+                raise RuntimeError(
+                    f"Cloud Session verification failed before Attachment restore: {storage_path}"
+                )
+            if session_row.get("file_size") is not None:
+                try:
+                    expected_size = int(session_row["file_size"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        f"Cloud Session has invalid file_size: {storage_path}"
+                    ) from exc
+                if len(content) != expected_size:
+                    raise RuntimeError(
+                        f"Cloud Session size verification failed before Attachment restore: "
+                        f"{storage_path}"
+                    )
+
+            descriptor, temp_name = tempfile.mkstemp(
+                prefix="codex-sync-cloud-session-",
+                suffix=".jsonl",
+            )
+            os.close(descriptor)
+            temp_path = Path(temp_name)
+            try:
+                temp_path.write_bytes(content)
+                for reference in session_references:
+                    original_path = str(reference.get("original_local_path") or "")
+                    if not original_path:
+                        continue
+                    variants = replacement_variants(original_path)
+                    occurrences = count_session_references(
+                        temp_path,
+                        {variant: variant for variant in variants},
+                    )
+                    if occurrences == 0:
+                        stale_ids.add(str(reference["id"]))
+            finally:
+                temp_path.unlink(missing_ok=True)
+        return stale_ids
+
     def restore(self) -> AttachmentDownloadSummary:
         ensure_environment(self.paths)
         session = self.auth.restore_session()
@@ -55,6 +130,11 @@ class AttachmentDownloadEngine:
         attachments = self.repository.list_attachments(session.user.id, session.access_token)
         references = self.repository.list_references(session.user.id, session.access_token)
         cloud_sessions = self.repository.list_sessions(session.user.id, session.access_token)
+        stale_reference_ids = self._stale_reference_ids(
+            references,
+            cloud_sessions,
+            session.access_token,
+        )
         references_by_attachment: dict[str, list[dict[str, object]]] = {}
         for reference in references:
             attachment_id = str(reference.get("attachment_id") or "")
@@ -133,10 +213,12 @@ class AttachmentDownloadEngine:
                 self.paths,
                 prepared,
                 cloud_sessions,
+                stale_reference_ids,
             )
         return AttachmentDownloadSummary(
             cloud_attachments=len(attachments),
             downloaded_objects=downloaded,
             reused_local_objects=reused,
             local_restore=local_summary,
+            stale_cloud_references_skipped=len(stale_reference_ids),
         )

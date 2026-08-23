@@ -13,6 +13,7 @@ from codex_sync.cloud.devices import DeviceService
 from codex_sync.hashing import sha256_bytes
 from codex_sync.local.catalog import read_stable_file
 from codex_sync.local.repair_engine import Paths
+from codex_sync.local.restore_engine import safe_restore_path
 from codex_sync.progress import emit_progress
 
 UTC = timezone.utc
@@ -32,6 +33,7 @@ class AttachmentUploadSummary:
     verified_attachments: int
     verified_references: int
     probe_issues: int
+    stale_references_removed: int
 
     def to_dict(self) -> dict[str, int]:
         return asdict(self)
@@ -216,16 +218,22 @@ class AttachmentUploadEngine:
             attachment_rows,
             session.access_token,
         )
+        existing_references = self.repository.list_references(
+            session.user.id,
+            session.access_token,
+        )
         reference_rows: list[dict[str, object]] = []
+        expected_reference_keys: dict[str, set[tuple[str, str]]] = {}
         for record in eligible:
             digest = str(record.sha256)
             cloud_session_id = session_ids.get(record.session_id) if record.session_id else None
             cloud_thread_id = thread_ids.get(record.thread_id) if record.thread_id else None
             if cloud_thread_id is None and record.session_id:
                 cloud_thread_id = session_thread_ids.get(record.session_id)
+            attachment_id = attachment_ids[digest]
             reference_rows.append(
                 {
-                    "attachment_id": attachment_ids[digest],
+                    "attachment_id": attachment_id,
                     "thread_id": cloud_thread_id,
                     "session_id": cloud_session_id,
                     "message_id": record.message_id,
@@ -234,11 +242,60 @@ class AttachmentUploadEngine:
                     "original_local_path": record.local_path,
                 }
             )
+            if cloud_session_id:
+                expected_reference_keys.setdefault(cloud_session_id, set()).add(
+                    (attachment_id, record.reference_location)
+                )
         self.repository.upsert_references(
             session.user.id,
             reference_rows,
             session.access_token,
         )
+
+        covered_cloud_session_ids: set[str] = set()
+        for row in session_rows:
+            cloud_session_id = str(row.get("id") or "")
+            relative_path = str(row.get("relative_path") or "")
+            if not cloud_session_id or not relative_path:
+                continue
+            try:
+                local_session_path = safe_restore_path(
+                    self.paths.codex_home,
+                    relative_path,
+                )
+            except RuntimeError:
+                continue
+            if local_session_path.is_file():
+                covered_cloud_session_ids.add(cloud_session_id)
+
+        stale_reference_ids = [
+            str(row["id"])
+            for row in existing_references
+            if row.get("id")
+            and str(row.get("session_id") or "") in covered_cloud_session_ids
+            and (
+                str(row.get("attachment_id") or ""),
+                str(row.get("reference_location") or ""),
+            )
+            not in expected_reference_keys.get(str(row.get("session_id") or ""), set())
+        ]
+        delete_references = getattr(self.repository, "delete_references", None)
+        if stale_reference_ids:
+            if not callable(delete_references):
+                raise RuntimeError("Attachment reference reconciliation is not supported")
+            stale_references_removed = int(
+                delete_references(
+                    session.user.id,
+                    stale_reference_ids,
+                    session.access_token,
+                )
+            )
+            if stale_references_removed != len(stale_reference_ids):
+                raise RuntimeError(
+                    "Cloud Attachment reference reconciliation removed an incomplete set"
+                )
+        else:
+            stale_references_removed = 0
 
         verified_entities = self.repository.list_attachments(
             session.user.id,
@@ -283,4 +340,5 @@ class AttachmentUploadEngine:
             verified_attachments=len(grouped),
             verified_references=len(expected_locations),
             probe_issues=len(result.issues),
+            stale_references_removed=stale_references_removed,
         )
