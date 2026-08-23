@@ -111,6 +111,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--target-cwd",
         help="Override the mapped working directory for restored Threads",
     )
+    restore_cloud_parser.add_argument(
+        "--replace-conflicting-sessions",
+        action="store_true",
+        help="Allow full recovery to replace same-path Sessions whose SHA256 differs",
+    )
     snapshot_restore_parser = subparsers.add_parser(
         "cloud-snapshot-restore",
         help="Restore plain-text history from a selected cloud Snapshot",
@@ -119,6 +124,11 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot_restore_parser.add_argument("--thread-id")
     snapshot_restore_parser.add_argument("--workspace-id")
     snapshot_restore_parser.add_argument("--target-cwd")
+    snapshot_restore_parser.add_argument(
+        "--replace-conflicting-sessions",
+        action="store_true",
+        help="Allow full recovery to replace same-path Sessions whose SHA256 differs",
+    )
     subparsers.add_parser(
         "workspace-list",
         help="List cloud Workspaces and this device's local mappings",
@@ -331,6 +341,7 @@ def main() -> int:
                         codex_thread_id=args.thread_id,
                         workspace_id=args.workspace_id,
                         target_cwd=Path(args.target_cwd) if args.target_cwd else None,
+                        replace_conflicting_sessions=args.replace_conflicting_sessions,
                     )
                     payload = {
                         "action": "cloud-restore",
@@ -362,6 +373,7 @@ def main() -> int:
                         codex_thread_id=args.thread_id,
                         workspace_id=args.workspace_id,
                         target_cwd=Path(args.target_cwd) if args.target_cwd else None,
+                        replace_conflicting_sessions=args.replace_conflicting_sessions,
                     )
                     payload = {
                         "action": "cloud-snapshot-restore",

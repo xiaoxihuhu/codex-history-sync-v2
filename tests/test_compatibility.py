@@ -54,6 +54,23 @@ class CompatibilityTests(unittest.TestCase):
     def test_v2_package_has_release_version(self) -> None:
         self.assertEqual(__version__, "2.0.1")
 
+    def test_cloud_restore_conflict_flag_is_explicit(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(
+            ["cloud-restore", "--replace-conflicting-sessions"]
+        )
+        self.assertTrue(args.replace_conflicting_sessions)
+
+        snapshot_args = parser.parse_args(
+            [
+                "cloud-snapshot-restore",
+                "--snapshot-id",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "--replace-conflicting-sessions",
+            ]
+        )
+        self.assertTrue(snapshot_args.replace_conflicting_sessions)
+
 
 if __name__ == "__main__":
     unittest.main()

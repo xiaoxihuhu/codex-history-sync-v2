@@ -81,6 +81,8 @@ def human_error(error: object) -> str:
         return "还有项目目录未映射，请先选择新电脑上的保存目录。"
     if "invalid login credentials" in lowered:
         return "登录失败，请检查邮箱和密码。"
+    if "session content conflict" in lowered:
+        return "本地已有同一 Session，但内容与云端版本不同。请使用完整恢复处理冲突。"
     if "quota" in lowered and (
         "exceeded" in lowered or "insufficient" in lowered or "storage" in lowered
     ):
@@ -227,7 +229,10 @@ def run_full_restore(
     update("backup", "成功", "本机安全备份已创建")
 
     update("history", "进行中", "恢复 Thread 和 Session")
-    history_restore = command("history", ["cloud-restore"])
+    history_restore = command(
+        "history",
+        ["cloud-restore", "--replace-conflicting-sessions"],
+    )
     update("history", "成功", "Thread 和 Session 恢复完成")
 
     update("attachments", "进行中", "恢复图片和附件")

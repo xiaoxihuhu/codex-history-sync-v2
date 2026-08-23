@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+import tempfile
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from codex_sync.atomic_io import atomic_write_bytes, atomic_write_stream
+from codex_sync.atomic_io import atomic_copy_file, atomic_write_bytes, atomic_write_stream
+from codex_sync.hashing import sha256_file
 from codex_sync.local.catalog import canonical_comparison_path
 from codex_sync.local.repair_engine import (
     WRITE_LOCK_RETRY_DELAY_SECONDS,
@@ -76,6 +78,7 @@ class PreparedTextRestore:
     codex_updated_at: str | None
     target_cwd: Path
     content_path: Path | None = None
+    replace_existing: bool = False
 
 
 @dataclass(frozen=True)
@@ -448,6 +451,7 @@ def restore_text_history(
     seen_paths: dict[Path, str] = {}
     insert_rows: list[dict[str, object]] = []
     files_to_create: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
+    files_to_replace: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
     existing_sessions = 0
 
     for entry in entries:
@@ -462,7 +466,24 @@ def restore_text_history(
         target_paths[entry.codex_thread_id] = target
 
         if target.exists():
-            payload = parse_session_meta_file(target, entry.codex_thread_id)
+            if entry.replace_existing:
+                if entry.content_path is not None:
+                    payload = parse_session_meta_file(entry.content_path, entry.codex_thread_id)
+                else:
+                    payload, _ending, _remainder = parse_session_meta(
+                        entry.content or b"",
+                        entry.codex_thread_id,
+                    )
+                files_to_replace.append(
+                    (
+                        target,
+                        entry.content,
+                        entry.content_path,
+                        entry,
+                    )
+                )
+            else:
+                payload = parse_session_meta_file(target, entry.codex_thread_id)
             existing_sessions += 1
         else:
             if entry.content is None and entry.content_path is None:
@@ -520,7 +541,12 @@ def restore_text_history(
     needs_index_rebuild = any(
         not entry.archived and entry.codex_thread_id not in index_before for entry in entries
     )
-    has_mutations = bool(files_to_create or insert_rows or needs_index_rebuild)
+    has_mutations = bool(
+        files_to_create
+        or files_to_replace
+        or insert_rows
+        or needs_index_rebuild
+    )
     if not has_mutations:
         verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
         return LocalRestoreSummary(
@@ -537,45 +563,90 @@ def restore_text_history(
     index_existed = paths.session_index_path.exists()
     safety_backup = make_backup(paths, "pre-cloud-restore")
     created_files: list[Path] = []
-    try:
-        for target, content, content_path, entry in files_to_create:
-            if target.exists():
-                raise RuntimeError(f"Session appeared during restore: {target}")
-            if content_path is not None:
-                atomic_adapt_session_file(
-                    content_path,
-                    target,
-                    entry.codex_thread_id,
-                    current_provider,
-                    current_model,
-                    target_cwds[entry.codex_thread_id],
-                )
-            else:
-                atomic_write_bytes(target, content or b"")
-            created_files.append(target)
+    replaced_backups: dict[Path, Path] = {}
+    with tempfile.TemporaryDirectory(prefix="codex-sync-restore-rollback-") as rollback_dir:
+        rollback_root = Path(rollback_dir)
+        for index, (target, _content, _content_path, _entry) in enumerate(files_to_replace):
+            backup_path = rollback_root / f"session-{index:06d}.jsonl"
+            atomic_copy_file(target, backup_path)
+            replaced_backups[target] = backup_path
 
-        insert_threads_with_retry(paths, insert_rows, columns)
-        update_provider_assignments(paths, current_provider, current_model)
-        sync_session_records(paths, current_provider, current_model)
-        with connect_db(paths.db_path, readonly=True) as conn:
-            index_summary = rebuild_session_index(paths, conn)
-        verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
-    except Exception as exc:
-        rollback_error: Exception | None = None
         try:
-            restore_database_with_retry(paths, safety_backup)
-            restore_metadata(paths, safety_backup)
-            for path in created_files:
-                path.unlink(missing_ok=True)
-            if not index_existed:
-                paths.session_index_path.unlink(missing_ok=True)
-        except Exception as rollback_exc:
-            rollback_error = rollback_exc
-        if rollback_error is not None:
-            raise RuntimeError(
-                f"Cloud restore failed and rollback also failed: {rollback_error}"
-            ) from exc
-        raise
+            for target, content, content_path, entry in files_to_create:
+                if target.exists():
+                    raise RuntimeError(f"Session appeared during restore: {target}")
+                if content_path is not None:
+                    atomic_adapt_session_file(
+                        content_path,
+                        target,
+                        entry.codex_thread_id,
+                        current_provider,
+                        current_model,
+                        target_cwds[entry.codex_thread_id],
+                    )
+                else:
+                    atomic_write_bytes(target, content or b"")
+                created_files.append(target)
+
+            for target, content, content_path, entry in files_to_replace:
+                if content_path is not None:
+                    atomic_copy_file(content_path, target)
+                else:
+                    if content is None:
+                        raise RuntimeError(
+                            f"Missing replacement content for Session {entry.codex_thread_id}"
+                        )
+                    atomic_write_bytes(target, content)
+                if target.stat().st_size != entry.file_size:
+                    raise RuntimeError(
+                        f"Replaced Session size mismatch: {entry.codex_thread_id}"
+                    )
+                if sha256_file(target) != entry.cloud_content_hash:
+                    raise RuntimeError(
+                        f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
+                    )
+
+            insert_threads_with_retry(paths, insert_rows, columns)
+            update_provider_assignments(paths, current_provider, current_model)
+            sync_session_records(paths, current_provider, current_model)
+            for target, content, content_path, entry in files_to_replace:
+                if content_path is not None:
+                    atomic_copy_file(content_path, target)
+                else:
+                    if content is None:
+                        raise RuntimeError(
+                            f"Missing replacement content for Session {entry.codex_thread_id}"
+                        )
+                    atomic_write_bytes(target, content)
+                if target.stat().st_size != entry.file_size:
+                    raise RuntimeError(
+                        f"Replaced Session size mismatch: {entry.codex_thread_id}"
+                    )
+                if sha256_file(target) != entry.cloud_content_hash:
+                    raise RuntimeError(
+                        f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
+                    )
+            with connect_db(paths.db_path, readonly=True) as conn:
+                index_summary = rebuild_session_index(paths, conn)
+            verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
+        except Exception as exc:
+            rollback_error: Exception | None = None
+            try:
+                restore_database_with_retry(paths, safety_backup)
+                restore_metadata(paths, safety_backup)
+                for path in created_files:
+                    path.unlink(missing_ok=True)
+                for path, backup_path in replaced_backups.items():
+                    atomic_copy_file(backup_path, path)
+                if not index_existed:
+                    paths.session_index_path.unlink(missing_ok=True)
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
+            if rollback_error is not None:
+                raise RuntimeError(
+                    f"Cloud restore failed and rollback also failed: {rollback_error}"
+                ) from exc
+            raise
 
     return LocalRestoreSummary(
         selected_threads=len(entries),

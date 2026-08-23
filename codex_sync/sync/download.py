@@ -9,11 +9,18 @@ from typing import Any
 from codex_sync.cloud.auth import AuthService
 from codex_sync.cloud.devices import DeviceService
 from codex_sync.cloud.restore import RestoreRepository
-from codex_sync.hashing import sha256_file
-from codex_sync.local.repair_engine import Paths, ensure_environment
+from codex_sync.hashing import sha256_bytes, sha256_file
+from codex_sync.local.repair_engine import (
+    Paths,
+    ensure_environment,
+    parse_current_model,
+    parse_current_provider,
+    read_text,
+)
 from codex_sync.local.restore_engine import (
     LocalRestoreSummary,
     PreparedTextRestore,
+    adapt_session_content,
     parse_session_meta_file,
     restore_text_history,
     safe_restore_path,
@@ -33,6 +40,7 @@ class ManualDownloadSummary:
     cloud_sessions: int
     downloaded_session_objects: int
     reused_local_sessions: int
+    replaced_conflicting_sessions: int
     local_restore: LocalRestoreSummary
 
     def to_dict(self) -> dict[str, object]:
@@ -69,6 +77,33 @@ def choose_session(
     )
 
 
+@dataclass(frozen=True)
+class SessionContentConflict:
+    relative_path: str
+    codex_session_id: str
+    local_sha256: str
+    cloud_sha256: str
+    local_file_size: int
+    cloud_file_size: int
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+class SessionContentConflictError(RuntimeError):
+    def __init__(self, conflict: SessionContentConflict) -> None:
+        self.conflict = conflict
+        super().__init__(
+            "Session content conflict: "
+            f"relative_path={conflict.relative_path}; "
+            f"codex_session_id={conflict.codex_session_id}; "
+            f"local_sha256={conflict.local_sha256}; "
+            f"cloud_sha256={conflict.cloud_sha256}; "
+            f"local_file_size={conflict.local_file_size}; "
+            f"cloud_file_size={conflict.cloud_file_size}"
+        )
+
+
 class ManualDownloadEngine:
     def __init__(
         self,
@@ -90,6 +125,7 @@ class ManualDownloadEngine:
         codex_thread_id: str | None = None,
         workspace_id: str | None = None,
         target_cwd: Path | None = None,
+        replace_conflicting_sessions: bool = False,
     ) -> ManualDownloadSummary:
         ensure_environment(self.paths)
         session = self.auth.restore_session()
@@ -145,10 +181,59 @@ class ManualDownloadEngine:
         prepared: list[PreparedTextRestore] = []
         downloaded_objects = 0
         reused_local = 0
+        replaced_conflicts = 0
         staged_by_hash: dict[str, Path] = {}
+        config_text = read_text(self.paths.config_path)
+        current_provider = parse_current_provider(config_text, self.paths)
+        current_model = parse_current_model(config_text, self.paths)
 
         with tempfile.TemporaryDirectory(prefix="codex-sync-restore-") as temp_dir:
             staging_root = Path(temp_dir)
+
+            def stage_session(
+                storage_path: str,
+                content_hash: str,
+                expected_size: int,
+                local_thread_id: str,
+            ) -> Path:
+                nonlocal downloaded_objects
+                content_path = staged_by_hash.get(content_hash)
+                if content_path is not None:
+                    return content_path
+                content_path = staging_root / f"{content_hash}.jsonl"
+                download_to_path = getattr(
+                    self.repository,
+                    "download_session_to_path",
+                    None,
+                )
+                if callable(download_to_path):
+                    download_to_path(
+                        session.user.id,
+                        storage_path,
+                        content_path,
+                        content_hash,
+                        expected_size,
+                        session.access_token,
+                    )
+                else:
+                    content = self.repository.download_session(
+                        storage_path,
+                        session.access_token,
+                    )
+                    content_path.write_bytes(content)
+                if content_path.stat().st_size != expected_size:
+                    raise RuntimeError(
+                        f"Downloaded Session size mismatch: {local_thread_id}"
+                    )
+                if sha256_file(content_path) != content_hash:
+                    raise RuntimeError(
+                        f"Downloaded Session SHA256 mismatch: {local_thread_id}"
+                    )
+                parse_session_meta_file(content_path, local_thread_id)
+                staged_by_hash[content_hash] = content_path
+                downloaded_objects += 1
+                return content_path
+
             for thread in threads:
                 cloud_thread_id = required_text(thread, "id", "Thread")
                 local_thread_id = required_text(thread, "codex_thread_id", "Thread")
@@ -175,43 +260,51 @@ class ManualDownloadEngine:
 
                 target = safe_restore_path(self.paths.codex_home, relative_path)
                 content_path: Path | None = None
+                replace_existing = False
                 if target.exists():
-                    reused_local += 1
-                else:
-                    content_path = staged_by_hash.get(content_hash)
-                    if content_path is None:
-                        content_path = staging_root / f"{content_hash}.jsonl"
-                        download_to_path = getattr(
-                            self.repository,
-                            "download_session_to_path",
-                            None,
+                    local_file_size = target.stat().st_size
+                    local_sha256 = sha256_file(target)
+                    if local_sha256 == content_hash:
+                        reused_local += 1
+                    else:
+                        staged_content_path = stage_session(
+                            storage_path,
+                            content_hash,
+                            expected_size,
+                            local_thread_id,
                         )
-                        if callable(download_to_path):
-                            download_to_path(
-                                session.user.id,
-                                storage_path,
-                                content_path,
-                                content_hash,
-                                expected_size,
-                                session.access_token,
-                            )
+                        adapted_content, _payload = adapt_session_content(
+                            staged_content_path.read_bytes(),
+                            local_thread_id,
+                            current_provider,
+                            current_model,
+                            target_cwds[local_thread_id],
+                        )
+                        if sha256_bytes(adapted_content) == local_sha256:
+                            reused_local += 1
                         else:
-                            content = self.repository.download_session(
-                                storage_path,
-                                session.access_token,
+                            conflict = SessionContentConflict(
+                                relative_path=relative_path,
+                                codex_session_id=str(
+                                    cloud_session.get("codex_session_id") or ""
+                                ),
+                                local_sha256=local_sha256,
+                                cloud_sha256=content_hash,
+                                local_file_size=local_file_size,
+                                cloud_file_size=expected_size,
                             )
-                            content_path.write_bytes(content)
-                        if content_path.stat().st_size != expected_size:
-                            raise RuntimeError(
-                                f"Downloaded Session size mismatch: {local_thread_id}"
-                            )
-                        if sha256_file(content_path) != content_hash:
-                            raise RuntimeError(
-                                f"Downloaded Session SHA256 mismatch: {local_thread_id}"
-                            )
-                        parse_session_meta_file(content_path, local_thread_id)
-                        staged_by_hash[content_hash] = content_path
-                        downloaded_objects += 1
+                            if not replace_conflicting_sessions:
+                                raise SessionContentConflictError(conflict)
+                            content_path = staged_content_path
+                            replace_existing = True
+                            replaced_conflicts += 1
+                else:
+                    content_path = stage_session(
+                        storage_path,
+                        content_hash,
+                        expected_size,
+                        local_thread_id,
+                    )
 
                 prepared.append(
                     PreparedTextRestore(
@@ -243,6 +336,7 @@ class ManualDownloadEngine:
                         ),
                         target_cwd=target_cwds[local_thread_id],
                         content_path=content_path,
+                        replace_existing=replace_existing,
                     )
                 )
 
@@ -253,5 +347,6 @@ class ManualDownloadEngine:
             cloud_sessions=len(prepared),
             downloaded_session_objects=downloaded_objects,
             reused_local_sessions=reused_local,
+            replaced_conflicting_sessions=replaced_conflicts,
             local_restore=local_summary,
         )

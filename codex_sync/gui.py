@@ -1382,7 +1382,13 @@ if PYSIDE6_AVAILABLE:
                 ("auth", "检查 Codex Sync 登录状态", ["auth-status"], "账号已登录", "auth"),
                 ("workspace", "检查项目目录映射", ["workspace-list"], "Workspace 已检查", "workspaces"),
                 ("backup", "创建本机安全备份", ["backup"], "本机安全备份已创建", "backup"),
-                ("history", "恢复 Thread 和 Session", ["cloud-restore"], "Thread 和 Session 恢复完成", "history_restore"),
+                (
+                    "history",
+                    "恢复 Thread 和 Session",
+                    ["cloud-restore", "--replace-conflicting-sessions"],
+                    "Thread 和 Session 恢复完成",
+                    "history_restore",
+                ),
                 (
                     "attachments",
                     "恢复图片和附件",
