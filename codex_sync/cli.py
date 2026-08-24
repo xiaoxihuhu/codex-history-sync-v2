@@ -36,6 +36,12 @@ from codex_sync.local.repair_engine import (
     sync_to_current_provider,
 )
 from codex_sync.local.thread_diagnose import diagnose_thread
+from codex_sync.native import (
+    CodexSchemaInspector,
+    NativeVisibilityVerifier,
+    create_native_snapshot,
+    export_native_state,
+)
 from codex_sync.progress import emit_progress
 from codex_sync.sync import SyncStateStore
 from codex_sync.sync.download import ManualDownloadEngine
@@ -81,6 +87,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read one Thread's database, index, and first-line Session metadata",
     )
     diagnose_parser.add_argument("--thread-id", required=True)
+    subparsers.add_parser(
+        "native-schema",
+        help="Read the current Codex SQLite schema without modifying it",
+    )
+    native_snapshot_parser = subparsers.add_parser(
+        "native-snapshot",
+        help="Create a local SQLite Backup API Native Snapshot",
+    )
+    native_snapshot_parser.add_argument("--output")
+    native_snapshot_parser.add_argument("--label", default="manual")
+    native_export_parser = subparsers.add_parser(
+        "native-export",
+        help="Export versioned Codex-native metadata to a local JSON file",
+    )
+    native_export_parser.add_argument("--output", required=True)
+    native_export_parser.add_argument("--session-index")
+    native_visibility_parser = subparsers.add_parser(
+        "native-visibility",
+        help="Verify Codex-native Thread visibility prerequisites without writing",
+    )
+    native_visibility_parser.add_argument(
+        "--thread-id",
+        action="append",
+        dest="thread_ids",
+    )
     configure_parser = subparsers.add_parser(
         "cloud-configure",
         help="Save the Supabase project URL and client-safe publishable/anon key",
@@ -198,6 +229,50 @@ def main() -> int:
             ).to_dict()
         elif args.command == "thread-diagnose":
             payload = diagnose_thread(paths, args.thread_id)
+        elif args.command == "native-schema":
+            payload = {
+                "action": "native-schema",
+                "schema": CodexSchemaInspector.inspect_path(paths.db_path).to_dict(),
+            }
+        elif args.command == "native-snapshot":
+            snapshot = create_native_snapshot(
+                paths.db_path,
+                Path(args.output) if args.output else None,
+                label=args.label,
+            )
+            payload = {
+                "action": "native-snapshot",
+                "snapshot": snapshot.to_dict(),
+            }
+        elif args.command == "native-export":
+            export = export_native_state(
+                paths.db_path,
+                session_index_path=(
+                    Path(args.session_index)
+                    if args.session_index
+                    else paths.session_index_path
+                ),
+            )
+            output = Path(args.output).expanduser()
+            export.write_json(output)
+            payload = {
+                "action": "native-export",
+                "output": str(output),
+                "threads": len(export.threads),
+                "projects": len(export.projects),
+                "project_roots": len(export.project_roots),
+                "related_tables": sorted(export.related_state),
+                "format_version": export.format_version,
+            }
+        elif args.command == "native-visibility":
+            report = NativeVisibilityVerifier().verify(
+                paths.db_path,
+                thread_ids=args.thread_ids,
+            )
+            payload = {
+                "action": "native-visibility",
+                "report": report.to_dict(),
+            }
         elif args.command == "cloud-configure":
             public_key = getpass.getpass("Supabase publishable/anon key: ")
             app_paths = default_app_paths()
@@ -471,3 +546,7 @@ def main() -> int:
     else:
         print(payload)
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

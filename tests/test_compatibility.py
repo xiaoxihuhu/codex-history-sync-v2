@@ -25,6 +25,10 @@ class CompatibilityTests(unittest.TestCase):
             "backup",
             "probe-attachments",
             "thread-diagnose",
+            "native-schema",
+            "native-snapshot",
+            "native-export",
+            "native-visibility",
             "cloud-configure",
             "auth-sign-up",
             "auth-sign-in",
@@ -47,6 +51,10 @@ class CompatibilityTests(unittest.TestCase):
                 command_args += ["--url", "https://example.supabase.co"]
             elif command == "thread-diagnose":
                 command_args += ["--thread-id", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+            elif command == "native-snapshot":
+                command_args += ["--output", "native.sqlite"]
+            elif command == "native-export":
+                command_args += ["--output", "native.json"]
             elif command in {"auth-sign-up", "auth-sign-in"}:
                 command_args += ["--email", "user@example.com"]
             elif command == "cloud-snapshot-restore":
