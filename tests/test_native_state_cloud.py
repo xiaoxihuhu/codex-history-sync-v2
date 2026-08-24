@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import sqlite3
+import tempfile
 import unittest
+from contextlib import closing
+from pathlib import Path
 
 from codex_sync.cloud.native_state import (
     EncryptedNativeSnapshotRepository,
@@ -11,6 +15,7 @@ from codex_sync.cloud.native_state import (
 from codex_sync.native import (
     NativeCloudPolicy,
     NativeCloudPolicyError,
+    NativeMergeEngine,
     NativeSchemaFingerprint,
     NativeStateCodec,
     NativeStateExport,
@@ -162,6 +167,41 @@ def _make_export(
     )
 
 
+def _create_merge_target(path: Path) -> None:
+    with closing(sqlite3.connect(path)) as connection:
+        connection.execute(
+            """
+            CREATE TABLE threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                model_provider TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                title TEXT NOT NULL,
+                sandbox_policy TEXT NOT NULL,
+                approval_mode TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                model TEXT,
+                preview TEXT NOT NULL DEFAULT '',
+                recency_at_ms INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER,
+                updated_at_ms INTEGER,
+                memory_mode TEXT NOT NULL DEFAULT 'enabled',
+                git_sha TEXT,
+                git_branch TEXT,
+                git_origin_url TEXT,
+                has_user_event INTEGER NOT NULL DEFAULT 0,
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                name TEXT,
+                history_mode TEXT NOT NULL DEFAULT 'legacy'
+            )
+            """
+        )
+        connection.commit()
+
+
 class NativeStateCloudTests(unittest.TestCase):
     def test_canonicalization_and_hash_ignore_order_and_transient_identity(self) -> None:
         first = {
@@ -246,6 +286,32 @@ class NativeStateCloudTests(unittest.TestCase):
             self.assertEqual(thread.metadata["thread_section_id"], "section-1")
             self.assertNotIn("api_key", thread.metadata)
             self.assertNotIn("database", decoded.source)
+            with tempfile.TemporaryDirectory() as raw:
+                target = Path(raw) / "state_5.sqlite"
+                _create_merge_target(target)
+                summary = NativeMergeEngine().merge(decoded, target)
+                self.assertEqual(summary.integrity_check, "ok")
+                with closing(sqlite3.connect(target)) as connection:
+                    merged = connection.execute(
+                        """
+                        SELECT preview, name, model_provider, memory_mode,
+                               git_branch, is_pinned, has_user_event
+                        FROM threads WHERE id = ?
+                        """,
+                        (thread.thread_id,),
+                    ).fetchone()
+                self.assertEqual(
+                    merged,
+                    (
+                        f"{kind} preview 0",
+                        f"{kind} name 0",
+                        "openai",
+                        "enabled",
+                        "main",
+                        1,
+                        1,
+                    ),
+                )
 
     def test_codec_keeps_source_roots_and_uses_relative_rollout_path(self) -> None:
         bundle = NativeStateCodec.encode_export(
