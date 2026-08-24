@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from codex_sync.atomic_io import atomic_copy_file, atomic_write_bytes, atomic_write_stream
-from codex_sync.hashing import sha256_file
+from codex_sync.hashing import sha256_bytes, sha256_file
 from codex_sync.local.catalog import canonical_comparison_path
 from codex_sync.local.repair_engine import (
     WRITE_LOCK_RETRY_DELAY_SECONDS,
@@ -96,6 +96,7 @@ class LocalRestoreSummary:
     verified_sessions: int
     rewritten_index_entries: int
     safety_backup: str | None
+    session_meta_cwd_mismatches: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -239,6 +240,83 @@ def atomic_adapt_session_file(
 
     atomic_write_stream(target, write)
     return adapted_payload
+
+
+def validate_cloud_session_content(entry: PreparedTextRestore) -> None:
+    if entry.content_path is not None:
+        actual_size = entry.content_path.stat().st_size
+        if actual_size != entry.file_size:
+            raise RuntimeError(
+                f"Cloud Session size mismatch before restore: {entry.codex_thread_id}"
+            )
+        actual_hash = sha256_file(entry.content_path)
+    else:
+        content = entry.content
+        if content is None:
+            raise RuntimeError(f"Missing cloud content for Session {entry.codex_thread_id}")
+        actual_size = len(content)
+        if actual_size != entry.file_size:
+            raise RuntimeError(
+                f"Cloud Session size mismatch before restore: {entry.codex_thread_id}"
+            )
+        actual_hash = sha256_bytes(content)
+    if actual_hash != entry.cloud_content_hash:
+        raise RuntimeError(
+            f"Cloud Session SHA256 mismatch before restore: {entry.codex_thread_id}"
+        )
+
+
+def canonical_session_cwd_matches(value: object, target_cwd: Path) -> bool:
+    raw_value = str(value or "").strip()
+    if not raw_value:
+        return False
+    try:
+        return canonical_comparison_path(
+            Path(raw_value),
+            strict=False,
+        ) == canonical_comparison_path(target_cwd, strict=False)
+    except (OSError, ValueError):
+        return raw_value.casefold() == str(target_cwd).casefold()
+
+
+def adapt_selected_session_metadata(
+    entries: list[PreparedTextRestore],
+    target_paths: dict[str, Path],
+    current_provider: str,
+    current_model: str | None,
+    *,
+    reconcile_existing_thread_metadata: bool,
+) -> int:
+    adapted_files = 0
+    selected_entries = (
+        entries
+        if reconcile_existing_thread_metadata
+        else [entry for entry in entries if entry.replace_existing]
+    )
+    for entry in selected_entries:
+        target = target_paths[entry.codex_thread_id]
+        payload = parse_session_meta_file(target, entry.codex_thread_id)
+        model_matches = (
+            current_model is None
+            or payload.get("model") is None
+            or str(payload.get("model")) == current_model
+        )
+        if (
+            canonical_session_cwd_matches(payload.get("cwd"), entry.target_cwd)
+            and str(payload.get("model_provider") or "") == current_provider
+            and model_matches
+        ):
+            continue
+        atomic_adapt_session_file(
+            target,
+            target,
+            entry.codex_thread_id,
+            current_provider,
+            current_model,
+            entry.target_cwd,
+        )
+        adapted_files += 1
+    return adapted_files
 
 
 def parse_cloud_time(value: str | None) -> tuple[int, int]:
@@ -528,28 +606,49 @@ def verify_restored_history(
     paths: Paths,
     entries: list[PreparedTextRestore],
     target_paths: dict[str, Path],
-) -> tuple[int, int]:
+    *,
+    cwd_thread_ids: set[str] | None = None,
+) -> tuple[int, int, int]:
     with connect_db(paths.db_path, readonly=True) as conn:
         integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity.lower() != "ok":
             raise RuntimeError(f"SQLite integrity check failed: {integrity}")
         placeholders = ", ".join("?" for _ in entries)
         ids = [entry.codex_thread_id for entry in entries]
+        columns = get_thread_columns(conn)
+        selected_columns = ["id"]
+        if "cwd" in columns:
+            selected_columns.append("cwd")
         rows = conn.execute(
-            f"SELECT id FROM threads WHERE id IN ({placeholders})",
+            f"SELECT {', '.join(selected_columns)} FROM threads WHERE id IN ({placeholders})",
             ids,
         ).fetchall()
         found_ids = {str(row["id"]) for row in rows}
+        database_cwds = {
+            str(row["id"]): row["cwd"]
+            for row in rows
+            if "cwd" in columns
+        }
     missing_threads = set(ids) - found_ids
     if missing_threads:
         raise RuntimeError(f"Restore verification found {len(missing_threads)} missing Threads")
 
     verified_sessions = 0
+    session_meta_cwd_mismatches = 0
     for entry in entries:
         target = target_paths[entry.codex_thread_id]
         if not target.is_file():
             raise RuntimeError(f"Restore verification found missing Session: {target}")
-        parse_session_meta_file(target, entry.codex_thread_id)
+        payload = parse_session_meta_file(target, entry.codex_thread_id)
+        if (
+            entry.codex_thread_id in (cwd_thread_ids or set())
+            and "cwd" in columns
+            and not canonical_session_cwd_matches(
+                database_cwds.get(entry.codex_thread_id),
+                Path(str(payload.get("cwd") or "")),
+            )
+        ):
+            session_meta_cwd_mismatches += 1
         verified_sessions += 1
 
     index = read_session_index(paths)
@@ -560,7 +659,12 @@ def verify_restored_history(
     ]
     if missing_index:
         raise RuntimeError(f"Restore verification found {len(missing_index)} missing index entries")
-    return len(found_ids), verified_sessions
+    if session_meta_cwd_mismatches:
+        raise RuntimeError(
+            "Restore verification found "
+            f"{session_meta_cwd_mismatches} session_meta cwd mismatches"
+        )
+    return len(found_ids), verified_sessions, session_meta_cwd_mismatches
 
 
 def restore_text_history(
@@ -625,6 +729,7 @@ def restore_text_history(
     update_rows: list[tuple[str, dict[str, object]]] = []
     files_to_create: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
     files_to_replace: list[tuple[Path, bytes | None, Path | None, PreparedTextRestore]] = []
+    cwd_verification_ids: set[str] = set()
     existing_sessions = 0
 
     for entry in entries:
@@ -655,6 +760,7 @@ def restore_text_history(
                         entry,
                     )
                 )
+                cwd_verification_ids.add(entry.codex_thread_id)
             else:
                 payload = parse_session_meta_file(target, entry.codex_thread_id)
             existing_sessions += 1
@@ -679,6 +785,7 @@ def restore_text_history(
                 files_to_create.append((target, adapted_content, None, entry))
             if entry.content_path is not None:
                 files_to_create.append((target, None, entry.content_path, entry))
+            cwd_verification_ids.add(entry.codex_thread_id)
 
         existing = existing_rows.get(entry.codex_thread_id)
         if existing is not None:
@@ -743,7 +850,18 @@ def restore_text_history(
         or needs_index_rebuild
     )
     if not has_mutations:
-        verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
+        if reconcile_existing_thread_metadata:
+            cwd_verification_ids = {entry.codex_thread_id for entry in entries}
+        (
+            verified_threads,
+            verified_sessions,
+            session_meta_cwd_mismatches,
+        ) = verify_restored_history(
+            paths,
+            entries,
+            target_paths,
+            cwd_thread_ids=cwd_verification_ids,
+        )
         return LocalRestoreSummary(
             selected_threads=len(entries),
             inserted_threads=0,
@@ -754,6 +872,7 @@ def restore_text_history(
             verified_sessions=verified_sessions,
             rewritten_index_entries=len(index_before),
             safety_backup=None,
+            session_meta_cwd_mismatches=session_meta_cwd_mismatches,
         )
 
     index_existed = paths.session_index_path.exists()
@@ -785,46 +904,54 @@ def restore_text_history(
                 created_files.append(target)
 
             for target, content, content_path, entry in files_to_replace:
+                validate_cloud_session_content(entry)
                 if content_path is not None:
-                    atomic_copy_file(content_path, target)
+                    atomic_adapt_session_file(
+                        content_path,
+                        target,
+                        entry.codex_thread_id,
+                        current_provider,
+                        current_model,
+                        target_cwds[entry.codex_thread_id],
+                    )
                 else:
                     if content is None:
                         raise RuntimeError(
                             f"Missing replacement content for Session {entry.codex_thread_id}"
                         )
-                    atomic_write_bytes(target, content)
-                if target.stat().st_size != entry.file_size:
-                    raise RuntimeError(
-                        f"Replaced Session size mismatch: {entry.codex_thread_id}"
+                    adapted_content, _payload = adapt_session_content(
+                        content,
+                        entry.codex_thread_id,
+                        current_provider,
+                        current_model,
+                        target_cwds[entry.codex_thread_id],
                     )
-                if sha256_file(target) != entry.cloud_content_hash:
-                    raise RuntimeError(
-                        f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
-                    )
+                    atomic_write_bytes(target, adapted_content)
 
             apply_thread_changes_with_retry(paths, insert_rows, update_rows, columns)
             update_provider_assignments(paths, current_provider, current_model)
             sync_session_records(paths, current_provider, current_model)
-            for target, content, content_path, entry in files_to_replace:
-                if content_path is not None:
-                    atomic_copy_file(content_path, target)
-                else:
-                    if content is None:
-                        raise RuntimeError(
-                            f"Missing replacement content for Session {entry.codex_thread_id}"
-                        )
-                    atomic_write_bytes(target, content)
-                if target.stat().st_size != entry.file_size:
-                    raise RuntimeError(
-                        f"Replaced Session size mismatch: {entry.codex_thread_id}"
-                    )
-                if sha256_file(target) != entry.cloud_content_hash:
-                    raise RuntimeError(
-                        f"Replaced Session SHA256 mismatch: {entry.codex_thread_id}"
-                    )
+            adapt_selected_session_metadata(
+                entries,
+                target_paths,
+                current_provider,
+                current_model,
+                reconcile_existing_thread_metadata=reconcile_existing_thread_metadata,
+            )
+            if reconcile_existing_thread_metadata:
+                cwd_verification_ids = {entry.codex_thread_id for entry in entries}
             with connect_db(paths.db_path, readonly=True) as conn:
                 index_summary = rebuild_restored_session_index(paths, conn, entries)
-            verified_threads, verified_sessions = verify_restored_history(paths, entries, target_paths)
+            (
+                verified_threads,
+                verified_sessions,
+                session_meta_cwd_mismatches,
+            ) = verify_restored_history(
+                paths,
+                entries,
+                target_paths,
+                cwd_thread_ids=cwd_verification_ids,
+            )
         except Exception as exc:
             rollback_error: Exception | None = None
             try:
@@ -854,4 +981,5 @@ def restore_text_history(
         verified_sessions=verified_sessions,
         rewritten_index_entries=index_summary["rewritten_index_entries"],
         safety_backup=str(safety_backup),
+        session_meta_cwd_mismatches=session_meta_cwd_mismatches,
     )

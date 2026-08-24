@@ -18,6 +18,7 @@ from codex_sync.local.repair_engine import (
     resolve_paths,
     write_session_index,
 )
+from codex_sync.local.restore_engine import canonical_session_cwd_matches
 from codex_sync.local.thread_diagnose import diagnose_thread
 from codex_sync.models import AuthSession, DeviceIdentity
 from codex_sync.sync.download import (
@@ -580,6 +581,7 @@ class TextRestoreTests(unittest.TestCase):
             )
 
             self.assertEqual(first.local_restore.reconciled_threads, 2)
+            self.assertEqual(first.local_restore.session_meta_cwd_mismatches, 0)
             self.assertIsNotNone(first.local_restore.safety_backup)
             with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
                 row = conn.execute(
@@ -596,6 +598,10 @@ class TextRestoreTests(unittest.TestCase):
                     "SELECT title, cwd FROM threads WHERE id = ?",
                     (local_only_id,),
                 ).fetchone()
+                restored_session_rows = conn.execute(
+                    "SELECT id, rollout_path FROM threads WHERE id IN (?, ?)",
+                    (ACTIVE_THREAD_ID, ARCHIVED_THREAD_ID),
+                ).fetchall()
                 integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
             self.assertEqual(Path(row[0]).parent.name, "21")
             self.assertEqual(row[1:13], (
@@ -615,6 +621,14 @@ class TextRestoreTests(unittest.TestCase):
             self.assertEqual(row[13], '{"type":"disabled"}')
             self.assertEqual(row[14], "never")
             self.assertEqual(local_only_row, ("Local-only title", str(workspace)))
+            for thread_id, rollout_path in restored_session_rows:
+                payload = json.loads(
+                    Path(rollout_path).read_text(encoding="utf-8").splitlines()[0]
+                )["payload"]
+                self.assertEqual(payload["id"], thread_id)
+                self.assertEqual(payload["cwd"], str(workspace))
+                self.assertEqual(payload["model_provider"], "openai")
+                self.assertEqual(payload["model"], "gpt-source")
             self.assertEqual(integrity, "ok")
 
             index = read_session_index(paths)
@@ -637,6 +651,20 @@ class TextRestoreTests(unittest.TestCase):
                 read_session_index(paths)[ACTIVE_THREAD_ID]["thread_name"],
                 desired_index_name,
             )
+
+    def test_windows_extended_path_is_canonical_equal_but_different_drive_is_not(self) -> None:
+        self.assertTrue(
+            canonical_session_cwd_matches(
+                r"\\?\C:\Users\ComputerB\Workspace",
+                Path(r"C:\Users\ComputerB\Workspace"),
+            )
+        )
+        self.assertFalse(
+            canonical_session_cwd_matches(
+                r"F:\CodexProjects\Workspace",
+                Path(r"C:\Users\ComputerB\Workspace"),
+            )
+        )
 
     def test_legacy_cloud_without_index_metadata_preserves_valid_local_name(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -914,7 +942,7 @@ class TextRestoreTests(unittest.TestCase):
             with closing(sqlite3.connect(target / "state_5.sqlite")) as conn:
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM threads").fetchone()[0], 0)
 
-    def test_cloud_wins_replaces_conflict_atomically_and_preserves_cloud_hash(self) -> None:
+    def test_cloud_wins_replaces_conflict_atomically_and_adapts_session_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             source = create_modern_codex_home(
@@ -952,8 +980,14 @@ class TextRestoreTests(unittest.TestCase):
             self.assertEqual(summary.downloaded_session_objects, 2)
             self.assertEqual(summary.local_restore.existing_sessions, 1)
             self.assertEqual(summary.local_restore.inserted_threads, 2)
-            self.assertEqual(session_path.read_bytes(), cloud_content)
-            self.assertEqual(sha256_file(session_path), str(row["content_hash"]))
+            actual_lines = session_path.read_bytes().splitlines()
+            cloud_lines = cloud_content.splitlines()
+            self.assertEqual(actual_lines[1:], cloud_lines[1:])
+            payload = json.loads(actual_lines[0])["payload"]
+            self.assertEqual(payload["cwd"], str(root.resolve()))
+            self.assertEqual(payload["model_provider"], "target-provider")
+            self.assertEqual(payload["model"], "gpt-target")
+            self.assertNotEqual(sha256_file(session_path), str(row["content_hash"]))
             self.assertNotEqual(session_path.read_bytes(), original_content)
             self.assertEqual(repository.download_calls, 2)
             self.assertIn(ACTIVE_THREAD_ID, read_session_index(resolve_paths(str(target))))
@@ -1045,18 +1079,23 @@ class TextRestoreTests(unittest.TestCase):
             )
             from codex_sync.local import restore_engine
 
-            real_atomic_copy = restore_engine.atomic_copy_file
+            real_atomic_adapt = restore_engine.atomic_adapt_session_file
             failure_injected = False
 
-            def fail_once(source_path: Path, destination: Path) -> None:
+            def fail_once(
+                source_path: Path,
+                destination: Path,
+                *_args: object,
+                **_kwargs: object,
+            ) -> dict[str, object]:
                 nonlocal failure_injected
                 if destination == session_path and not failure_injected:
                     failure_injected = True
                     raise OSError("injected atomic replacement failure")
-                real_atomic_copy(source_path, destination)
+                return real_atomic_adapt(source_path, destination, *_args, **_kwargs)
 
             with patch(
-                "codex_sync.local.restore_engine.atomic_copy_file",
+                "codex_sync.local.restore_engine.atomic_adapt_session_file",
                 side_effect=fail_once,
             ):
                 with self.assertRaisesRegex(OSError, "injected atomic replacement failure"):
@@ -1094,7 +1133,7 @@ class TextRestoreTests(unittest.TestCase):
                 repository,
             ).restore(target_cwd=root)
             self.assertEqual(rerun.reused_local_sessions, 2)
-            self.assertEqual(rerun.downloaded_session_objects, 1)
+            self.assertEqual(rerun.downloaded_session_objects, 2)
 
     def test_cloud_wins_handles_a_52mb_session_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1162,8 +1201,15 @@ class TextRestoreTests(unittest.TestCase):
             )
 
             self.assertEqual(summary.replaced_conflicting_sessions, 1)
-            self.assertEqual(session_path.stat().st_size, target_size)
-            self.assertEqual(sha256_file(session_path), digest)
+            actual_content = session_path.read_bytes()
+            self.assertEqual(
+                actual_content.split(b"\n", 1)[1:],
+                cloud_content.split(b"\n", 1)[1:],
+            )
+            self.assertNotEqual(len(actual_content), target_size)
+            self.assertNotEqual(sha256_file(session_path), digest)
+            payload = json.loads(actual_content.splitlines()[0])["payload"]
+            self.assertEqual(payload["cwd"], str(root.resolve()))
 
     def test_restore_supports_legacy_threads_schema(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

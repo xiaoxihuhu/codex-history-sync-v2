@@ -2,6 +2,12 @@
 
 本项目从 `v1.0.0` 开始记录正式版本变更。
 
+## [2.0.1-rc8] - 2026-08-24
+
+- 修复完整恢复后 SQLite `threads.cwd` 与 Session 首行 `session_meta.cwd` 不一致导致 Codex Desktop Thread 不可见的问题。
+- 对已有、替换和新下载 Session 仅原子重写首行 metadata，保持对话正文不变。
+- 增加 Windows canonical path、Cloud-Wins、provider/model 和 `session_meta_cwd_mismatches` 回归验证。
+
 ## [2.0.1-rc7] - 2026-08-23
 
 - 云端 Thread 元数据独立保存真实 `session_index` 名称和更新时间。
