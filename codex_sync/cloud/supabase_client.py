@@ -99,10 +99,12 @@ class SupabaseError(RuntimeError):
         status_code: int | None = None,
         code: str | None = None,
         cause: Exception | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.code = code
+        self.headers = dict(headers or {})
         self.__cause__ = cause
 
 
@@ -153,7 +155,7 @@ class SupabaseClient:
                 access_token or "",
                 *collect_sensitive_values(payload),
             ]
-            raise error_from_response(response.status, decoded, sensitive_values)
+            raise error_from_response(response.status, decoded, sensitive_values, headers=response.headers)
         return decoded
 
     def request_bytes(
@@ -188,6 +190,7 @@ class SupabaseClient:
                 response.status,
                 decoded,
                 [self.config.public_key, access_token],
+                headers=response.headers,
             )
         return decoded
 
@@ -219,6 +222,7 @@ class SupabaseClient:
                 response.status,
                 decoded,
                 [self.config.public_key, access_token],
+                headers=response.headers,
             )
         return response.body
 
@@ -269,6 +273,7 @@ class SupabaseClient:
                 response.status,
                 decoded,
                 [self.config.public_key, access_token],
+                headers=response.headers,
             )
         return written
 
@@ -311,6 +316,8 @@ def error_from_response(
     status_code: int,
     payload: Any,
     sensitive_values: list[str] | None = None,
+    *,
+    headers: Mapping[str, str] | None = None,
 ) -> SupabaseError:
     if isinstance(payload, dict):
         message = (
@@ -329,4 +336,5 @@ def error_from_response(
         safe_message,
         status_code=status_code,
         code=str(code) if code else None,
+        headers=headers,
     )

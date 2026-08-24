@@ -11,8 +11,19 @@ from .native_state import (
     EncryptedNativeSnapshotRepository,
     FakeSupabaseNativeStateRepository,
     InMemoryNativeStateRepository,
+    NativeAuthMismatchError,
+    NativeCloudExportIncomplete,
+    NativeCloudExportNotFound,
+    NativeCloudIntegrityError,
+    NativeCloudRetryPolicy,
+    NativeCloudSchemaNotInstalled,
+    NativeCloudSchemaVerifier,
     NativeStateRepository,
+    SupabaseNativeStateRepository,
 )
+from .native_backup import NativeCloudBackupResult, NativeCloudBackupService, link_snapshot_native_export
+from .native_manifest import NativeExportManifest
+from .native_restore import NativeCloudRestoreResult, NativeCloudRestoreService
 from .workspaces import SupabaseWorkspaceRepository
 
 __all__ = [
@@ -30,4 +41,18 @@ __all__ = [
     "FakeSupabaseNativeStateRepository",
     "InMemoryNativeStateRepository",
     "NativeStateRepository",
+    "SupabaseNativeStateRepository",
+    "NativeAuthMismatchError",
+    "NativeCloudExportIncomplete",
+    "NativeCloudExportNotFound",
+    "NativeCloudIntegrityError",
+    "NativeCloudRetryPolicy",
+    "NativeCloudSchemaNotInstalled",
+    "NativeCloudSchemaVerifier",
+    "NativeCloudBackupResult",
+    "NativeCloudBackupService",
+    "NativeExportManifest",
+    "NativeCloudRestoreResult",
+    "NativeCloudRestoreService",
+    "link_snapshot_native_export",
 ]
