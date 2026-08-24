@@ -1,7 +1,8 @@
 # Native State Cloud Schema
 
-This document describes the additive Phase 10 schema in
-`migrations/010_native_state.sql`. It is not a deployment instruction.
+This document describes the additive Phase 10 schema introduced by
+`migrations/010_native_state.sql` and corrected by
+`migrations/011_native_state_fk_fix.sql`. It is not a deployment instruction.
 
 ## Tables
 
@@ -42,7 +43,12 @@ Threads, and related state. Existing Devices, old V2 Threads, Sessions,
 Attachments, and Snapshots are not deleted by that cascade.
 
 `snapshots.native_export_id` is nullable and references an export with
-`ON DELETE SET NULL`, preserving old Snapshot behavior.
+column-scoped `ON DELETE SET NULL (native_export_id)`. Deleting an export
+preserves the Snapshot and its `user_id`.
+
+The Device relationships on `native_state_exports` and `native_threads` use
+composite `(user_id, source_device_id)` foreign keys. Deleting a Device clears
+only `source_device_id`; it never clears the child row's `user_id`.
 
 ## RLS And Data API Contract
 

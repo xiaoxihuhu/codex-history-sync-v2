@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 
 from codex_sync.native.policy import NativeCloudPolicy
 
 MIGRATION_DIR = Path(__file__).parents[1] / "migrations"
+ORIGINAL_010_GIT_BLOB = "f6f75e2611c968d26cf145996a5f6369fe908d90"
 EXPECTED_MIGRATIONS = [
     "001_profiles.sql",
     "002_devices.sql",
@@ -18,6 +21,7 @@ EXPECTED_MIGRATIONS = [
     "008_snapshots.sql",
     "009_rls.sql",
     "010_native_state.sql",
+    "011_native_state_fk_fix.sql",
 ]
 PUBLIC_TABLES = [
     "profiles",
@@ -40,6 +44,473 @@ def read_migration(name: str) -> str:
 
 def normalized_sql() -> str:
     return "\n".join(read_migration(name) for name in EXPECTED_MIGRATIONS).lower()
+
+
+@dataclass(frozen=True)
+class ForeignKeyContract:
+    table: str
+    name: str
+    columns: tuple[str, ...]
+    referenced_table: str
+    referenced_columns: tuple[str, ...]
+    on_delete: str
+    set_null_columns: tuple[str, ...] = ()
+
+
+class MigrationSimulationError(RuntimeError):
+    pass
+
+
+class NativeMigrationFixture:
+    """Small PostgreSQL contract simulator for Native FK migration behavior."""
+
+    ADD_CONSTRAINT = re.compile(
+        r"alter table public\.(?P<table>\w+)\s+"
+        r"add constraint (?P<name>\w+)\s+"
+        r"foreign key \((?P<columns>[^)]+)\)\s+"
+        r"references public\.(?P<referenced_table>\w+)\s+"
+        r"\((?P<referenced_columns>[^)]+)\)\s+"
+        r"on delete (?P<action>cascade|set null)"
+        r"(?:\s+\((?P<set_null_columns>[^)]+)\))?;",
+        re.IGNORECASE | re.DOTALL,
+    )
+    DROP_CONSTRAINT = re.compile(
+        r"alter table public\.(?P<table>\w+)\s+"
+        r"drop constraint if exists (?P<name>\w+);",
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    def __init__(self) -> None:
+        self.tables: set[str] = set()
+        self.columns: dict[str, set[str]] = {}
+        self.not_null: dict[str, set[str]] = {}
+        self.foreign_keys: dict[tuple[str, str], ForeignKeyContract] = {}
+        self.rows: dict[str, list[dict[str, object]]] = {}
+
+    def apply_original_010(self, sql: str) -> None:
+        for table in (
+            "native_state_exports",
+            "native_projects",
+            "native_project_roots",
+            "native_threads",
+            "native_related_state",
+        ):
+            if not re.search(rf"create table public\.{table}\s*\(", sql, re.IGNORECASE):
+                raise MigrationSimulationError(f"010 is missing table {table}")
+            self.tables.add(table)
+            self.rows.setdefault(table, [])
+        self.tables.update({"auth.users", "devices", "snapshots"})
+        self.rows.setdefault("auth.users", [])
+        self.rows.setdefault("devices", [])
+        self.rows.setdefault("snapshots", [])
+        self.columns = {
+            "auth.users": {"id"},
+            "devices": {"id", "user_id"},
+            "snapshots": {"id", "user_id", "native_export_id"},
+            "native_state_exports": {"id", "user_id", "source_device_id"},
+            "native_projects": {"id", "user_id", "export_id"},
+            "native_project_roots": {
+                "id",
+                "user_id",
+                "export_id",
+                "native_project_id",
+            },
+            "native_threads": {
+                "id",
+                "user_id",
+                "export_id",
+                "source_device_id",
+                "native_project_id",
+            },
+            "native_related_state": {"id", "user_id", "export_id"},
+        }
+        self.not_null = {
+            "auth.users": {"id"},
+            "devices": {"id", "user_id"},
+            "snapshots": {"id", "user_id"},
+            "native_state_exports": {"id", "user_id"},
+            "native_projects": {"id", "user_id", "export_id"},
+            "native_project_roots": {
+                "id",
+                "user_id",
+                "export_id",
+                "native_project_id",
+            },
+            "native_threads": {"id", "user_id", "export_id"},
+            "native_related_state": {"id", "user_id", "export_id"},
+        }
+        if not re.search(
+            r"source_device_id uuid references public\.devices\(id\) "
+            r"on delete set null",
+            sql,
+            re.IGNORECASE,
+        ):
+            raise MigrationSimulationError("010 source_device_id FK contract changed")
+        self._put_fk(
+            ForeignKeyContract(
+                "native_state_exports",
+                "native_state_exports_source_device_id_fkey",
+                ("source_device_id",),
+                "devices",
+                ("id",),
+                "SET NULL",
+            )
+        )
+        self._put_fk(
+            ForeignKeyContract(
+                "native_threads",
+                "native_threads_source_device_id_fkey",
+                ("source_device_id",),
+                "devices",
+                ("id",),
+                "SET NULL",
+            )
+        )
+        snapshot_match = re.search(
+            r"add constraint snapshots_native_export_fk\s+"
+            r"foreign key \(user_id, native_export_id\)\s+"
+            r"references public\.native_state_exports \(user_id, id\)\s+"
+            r"on delete set null;",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if snapshot_match is None:
+            raise MigrationSimulationError("010 Snapshot FK contract changed")
+        self._put_fk(
+            ForeignKeyContract(
+                "snapshots",
+                "snapshots_native_export_fk",
+                ("user_id", "native_export_id"),
+                "native_state_exports",
+                ("user_id", "id"),
+                "SET NULL",
+            )
+        )
+        for contract in (
+            ForeignKeyContract(
+                "native_state_exports",
+                "native_state_exports_user_id_fkey",
+                ("user_id",),
+                "auth.users",
+                ("id",),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_projects",
+                "native_projects_user_id_fkey",
+                ("user_id",),
+                "auth.users",
+                ("id",),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_projects",
+                "native_projects_user_id_export_id_fkey",
+                ("user_id", "export_id"),
+                "native_state_exports",
+                ("user_id", "id"),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_project_roots",
+                "native_project_roots_user_id_fkey",
+                ("user_id",),
+                "auth.users",
+                ("id",),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_project_roots",
+                "native_project_roots_user_id_export_id_fkey",
+                ("user_id", "export_id"),
+                "native_state_exports",
+                ("user_id", "id"),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_project_roots",
+                "native_project_roots_user_id_native_project_id_export_id_fkey",
+                ("user_id", "native_project_id", "export_id"),
+                "native_projects",
+                ("user_id", "id", "export_id"),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_threads",
+                "native_threads_user_id_fkey",
+                ("user_id",),
+                "auth.users",
+                ("id",),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_threads",
+                "native_threads_native_project_id_fkey",
+                ("native_project_id",),
+                "native_projects",
+                ("id",),
+                "SET NULL",
+            ),
+            ForeignKeyContract(
+                "native_threads",
+                "native_threads_user_id_export_id_fkey",
+                ("user_id", "export_id"),
+                "native_state_exports",
+                ("user_id", "id"),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_related_state",
+                "native_related_state_user_id_fkey",
+                ("user_id",),
+                "auth.users",
+                ("id",),
+                "CASCADE",
+            ),
+            ForeignKeyContract(
+                "native_related_state",
+                "native_related_state_user_id_export_id_fkey",
+                ("user_id", "export_id"),
+                "native_state_exports",
+                ("user_id", "id"),
+                "CASCADE",
+            ),
+        ):
+            self._put_fk(contract)
+
+    def apply_011(self, sql: str) -> None:
+        for match in self.DROP_CONSTRAINT.finditer(sql):
+            self.foreign_keys.pop(
+                (match.group("table").lower(), match.group("name").lower()),
+                None,
+            )
+        added = 0
+        for match in self.ADD_CONSTRAINT.finditer(sql):
+            columns = self._columns(match.group("columns"))
+            referenced_columns = self._columns(match.group("referenced_columns"))
+            set_null_columns = self._columns(match.group("set_null_columns") or "")
+            self._put_fk(
+                ForeignKeyContract(
+                    match.group("table").lower(),
+                    match.group("name").lower(),
+                    columns,
+                    match.group("referenced_table").lower(),
+                    referenced_columns,
+                    match.group("action").upper(),
+                    set_null_columns,
+                )
+            )
+            added += 1
+        if added != 3:
+            raise MigrationSimulationError(f"011 must add exactly 3 FKs, found {added}")
+
+    def insert(self, table: str, **values: object) -> None:
+        self.rows.setdefault(table, []).append(dict(values))
+
+    def delete(self, table: str, **key: object) -> None:
+        parents = [
+            row
+            for row in self.rows.get(table, [])
+            if all(row.get(name) == value for name, value in key.items())
+        ]
+        if len(parents) != 1:
+            raise MigrationSimulationError(f"Expected one {table} parent row")
+        parent = parents[0]
+        mutations: list[tuple[dict[str, object], dict[str, object]]] = []
+        removals: list[tuple[str, dict[str, object]]] = []
+        for contract in self.foreign_keys.values():
+            if contract.referenced_table != table:
+                continue
+            parent_key = tuple(parent.get(name) for name in contract.referenced_columns)
+            for child in self.rows.get(contract.table, []):
+                child_key = tuple(child.get(name) for name in contract.columns)
+                if child_key != parent_key:
+                    continue
+                if contract.on_delete == "CASCADE":
+                    removals.append((contract.table, child))
+                    continue
+                target_columns = contract.set_null_columns or contract.columns
+                if any(
+                    column in self.not_null.get(contract.table, set())
+                    for column in target_columns
+                ):
+                    raise MigrationSimulationError(
+                        f"{contract.name} would null a NOT NULL ownership column"
+                    )
+                mutations.append(
+                    (
+                        child,
+                        {column: None for column in target_columns},
+                    )
+                )
+        for child, values in mutations:
+            child.update(values)
+        for child_table, child in removals:
+            self.rows[child_table].remove(child)
+        self.rows[table].remove(parent)
+
+    def contract(self, table: str, name: str) -> ForeignKeyContract:
+        return self.foreign_keys[(table, name)]
+
+    def target_contracts(self) -> dict[str, tuple[object, ...]]:
+        names = (
+            ("native_state_exports", "native_state_exports_user_id_fkey"),
+            ("native_state_exports", "native_state_exports_user_id_source_device_id_fkey"),
+            ("native_projects", "native_projects_user_id_fkey"),
+            ("native_projects", "native_projects_user_id_export_id_fkey"),
+            ("native_project_roots", "native_project_roots_user_id_fkey"),
+            ("native_project_roots", "native_project_roots_user_id_export_id_fkey"),
+            (
+                "native_project_roots",
+                "native_project_roots_user_id_native_project_id_export_id_fkey",
+            ),
+            ("native_threads", "native_threads_user_id_fkey"),
+            ("native_threads", "native_threads_user_id_source_device_id_fkey"),
+            ("native_threads", "native_threads_native_project_id_fkey"),
+            ("native_threads", "native_threads_user_id_export_id_fkey"),
+            ("native_related_state", "native_related_state_user_id_fkey"),
+            ("native_related_state", "native_related_state_user_id_export_id_fkey"),
+            ("snapshots", "snapshots_native_export_fk"),
+        )
+        return {
+            name: (
+                contract.table,
+                contract.columns,
+                contract.referenced_table,
+                contract.referenced_columns,
+                contract.on_delete,
+                contract.set_null_columns,
+            )
+            for table, name in names
+            if (contract := self.foreign_keys.get((table, name))) is not None
+        }
+
+    def _put_fk(self, contract: ForeignKeyContract) -> None:
+        self.foreign_keys[(contract.table, contract.name)] = contract
+
+    @staticmethod
+    def _columns(value: str) -> tuple[str, ...]:
+        return tuple(
+            item.strip().lower()
+            for item in value.split(",")
+            if item.strip()
+        )
+
+
+PRODUCTION_NATIVE_FK_CONTRACT = {
+    "native_state_exports_user_id_fkey": (
+        "native_state_exports",
+        ("user_id",),
+        "auth.users",
+        ("id",),
+        "CASCADE",
+        (),
+    ),
+    "native_state_exports_user_id_source_device_id_fkey": (
+        "native_state_exports",
+        ("user_id", "source_device_id"),
+        "devices",
+        ("user_id", "id"),
+        "SET NULL",
+        ("source_device_id",),
+    ),
+    "native_projects_user_id_fkey": (
+        "native_projects",
+        ("user_id",),
+        "auth.users",
+        ("id",),
+        "CASCADE",
+        (),
+    ),
+    "native_projects_user_id_export_id_fkey": (
+        "native_projects",
+        ("user_id", "export_id"),
+        "native_state_exports",
+        ("user_id", "id"),
+        "CASCADE",
+        (),
+    ),
+    "native_project_roots_user_id_fkey": (
+        "native_project_roots",
+        ("user_id",),
+        "auth.users",
+        ("id",),
+        "CASCADE",
+        (),
+    ),
+    "native_project_roots_user_id_export_id_fkey": (
+        "native_project_roots",
+        ("user_id", "export_id"),
+        "native_state_exports",
+        ("user_id", "id"),
+        "CASCADE",
+        (),
+    ),
+    "native_project_roots_user_id_native_project_id_export_id_fkey": (
+        "native_project_roots",
+        ("user_id", "native_project_id", "export_id"),
+        "native_projects",
+        ("user_id", "id", "export_id"),
+        "CASCADE",
+        (),
+    ),
+    "native_threads_user_id_fkey": (
+        "native_threads",
+        ("user_id",),
+        "auth.users",
+        ("id",),
+        "CASCADE",
+        (),
+    ),
+    "native_threads_user_id_source_device_id_fkey": (
+        "native_threads",
+        ("user_id", "source_device_id"),
+        "devices",
+        ("user_id", "id"),
+        "SET NULL",
+        ("source_device_id",),
+    ),
+    "native_threads_native_project_id_fkey": (
+        "native_threads",
+        ("native_project_id",),
+        "native_projects",
+        ("id",),
+        "SET NULL",
+        (),
+    ),
+    "native_threads_user_id_export_id_fkey": (
+        "native_threads",
+        ("user_id", "export_id"),
+        "native_state_exports",
+        ("user_id", "id"),
+        "CASCADE",
+        (),
+    ),
+    "native_related_state_user_id_fkey": (
+        "native_related_state",
+        ("user_id",),
+        "auth.users",
+        ("id",),
+        "CASCADE",
+        (),
+    ),
+    "native_related_state_user_id_export_id_fkey": (
+        "native_related_state",
+        ("user_id", "export_id"),
+        "native_state_exports",
+        ("user_id", "id"),
+        "CASCADE",
+        (),
+    ),
+    "snapshots_native_export_fk": (
+        "snapshots",
+        ("user_id", "native_export_id"),
+        "native_state_exports",
+        ("user_id", "id"),
+        "SET NULL",
+        ("native_export_id",),
+    ),
+}
 
 
 class MigrationContractTests(unittest.TestCase):
@@ -239,6 +710,7 @@ class MigrationContractTests(unittest.TestCase):
 
     def test_native_state_migration_is_additive_and_contract_complete(self) -> None:
         native = read_migration("010_native_state.sql").lower()
+        fix = read_migration("011_native_state_fk_fix.sql").lower()
         for table in (
             "native_state_exports",
             "native_projects",
@@ -262,9 +734,9 @@ class MigrationContractTests(unittest.TestCase):
         self.assertIn("metadata_hash text not null", native)
         self.assertIn(
             "foreign key (user_id, source_device_id)\n"
-            "    references public.devices (user_id, id)\n"
-            "    on delete set null (source_device_id)",
-            native,
+            "  references public.devices (user_id, id)\n"
+            "  on delete set null (source_device_id)",
+            fix,
         )
         self.assertIn("unique (export_id, source_project_id)", native)
         self.assertIn("unique (native_project_id, position)", native)
@@ -274,9 +746,135 @@ class MigrationContractTests(unittest.TestCase):
             native,
         )
         self.assertIn("snapshots_native_export_fk", native)
-        self.assertIn("on delete set null (native_export_id)", native)
+        self.assertIn("on delete set null (native_export_id)", fix)
         self.assertNotRegex(native, r"\bdrop\s+(table|schema)\b")
+        self.assertNotRegex(fix, r"\bdrop\s+(table|schema)\b")
+        self.assertNotRegex(fix, r"\b(truncate|delete\s+from)\b")
         self.assertNotIn("state_5.sqlite", native)
+
+    def test_native_state_010_matches_first_production_deployment(self) -> None:
+        content = (MIGRATION_DIR / "010_native_state.sql").read_bytes().replace(
+            b"\r\n",
+            b"\n",
+        )
+        blob = b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+        self.assertEqual(hashlib.sha1(blob).hexdigest(), ORIGINAL_010_GIT_BLOB)
+        native = content.decode("utf-8").lower()
+        self.assertIn(
+            "source_device_id uuid references public.devices(id) on delete set null",
+            native,
+        )
+        self.assertIn(
+            "references public.native_state_exports (user_id, id)\n"
+            "  on delete set null;",
+            native,
+        )
+        self.assertNotIn("on delete set null (native_export_id)", native)
+        self.assertNotIn("on delete set null (source_device_id)", native)
+
+    def test_original_010_reproduces_snapshot_composite_set_null_failure(self) -> None:
+        fixture = NativeMigrationFixture()
+        fixture.apply_original_010(read_migration("010_native_state.sql"))
+        fixture.insert("native_state_exports", id="export-a", user_id="user-a")
+        fixture.insert(
+            "snapshots",
+            id="snapshot-a",
+            user_id="user-a",
+            native_export_id="export-a",
+        )
+        with self.assertRaisesRegex(
+            MigrationSimulationError,
+            "NOT NULL ownership column",
+        ):
+            fixture.delete("native_state_exports", id="export-a")
+        self.assertEqual(
+            fixture.rows["snapshots"],
+            [
+                {
+                    "id": "snapshot-a",
+                    "user_id": "user-a",
+                    "native_export_id": "export-a",
+                }
+            ],
+        )
+
+    def test_fresh_010_then_011_matches_production_and_preserves_ownership(self) -> None:
+        fixture = NativeMigrationFixture()
+        fixture.apply_original_010(read_migration("010_native_state.sql"))
+        fixture.apply_011(read_migration("011_native_state_fk_fix.sql"))
+        self.assertEqual(
+            fixture.tables.intersection(
+                {
+                    "native_state_exports",
+                    "native_projects",
+                    "native_project_roots",
+                    "native_threads",
+                    "native_related_state",
+                }
+            ),
+            {
+                "native_state_exports",
+                "native_projects",
+                "native_project_roots",
+                "native_threads",
+                "native_related_state",
+            },
+        )
+        self.assertIn("native_export_id", fixture.columns["snapshots"])
+        self.assertEqual(fixture.target_contracts(), PRODUCTION_NATIVE_FK_CONTRACT)
+
+        fixture.insert("devices", id="device-a", user_id="user-a")
+        fixture.insert(
+            "native_state_exports",
+            id="export-a",
+            user_id="user-a",
+            source_device_id="device-a",
+        )
+        fixture.insert(
+            "native_threads",
+            id="thread-a",
+            user_id="user-a",
+            export_id="export-a",
+            source_device_id="device-a",
+        )
+        fixture.insert(
+            "snapshots",
+            id="snapshot-a",
+            user_id="user-a",
+            native_export_id="export-a",
+        )
+        fixture.delete("devices", id="device-a")
+        self.assertEqual(
+            fixture.rows["native_state_exports"][0]["user_id"],
+            "user-a",
+        )
+        self.assertIsNone(
+            fixture.rows["native_state_exports"][0]["source_device_id"]
+        )
+        self.assertEqual(fixture.rows["native_threads"][0]["user_id"], "user-a")
+        self.assertIsNone(fixture.rows["native_threads"][0]["source_device_id"])
+
+        fixture.delete("native_state_exports", id="export-a")
+        self.assertEqual(
+            fixture.rows["snapshots"],
+            [
+                {
+                    "id": "snapshot-a",
+                    "user_id": "user-a",
+                    "native_export_id": None,
+                }
+            ],
+        )
+
+    def test_011_is_repeatable_after_the_fixed_schema(self) -> None:
+        fixture = NativeMigrationFixture()
+        fixture.apply_original_010(read_migration("010_native_state.sql"))
+        fix = read_migration("011_native_state_fk_fix.sql")
+        fixture.apply_011(fix)
+        first_contract = fixture.target_contracts()
+        fixture.apply_011(fix)
+        self.assertEqual(fixture.target_contracts(), first_contract)
+        self.assertEqual(first_contract, PRODUCTION_NATIVE_FK_CONTRACT)
 
     def test_native_state_allowlist_and_policy_contract_are_explicit(self) -> None:
         native = read_migration("010_native_state.sql").lower()

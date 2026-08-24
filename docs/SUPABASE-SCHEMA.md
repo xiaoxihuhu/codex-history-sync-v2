@@ -17,6 +17,8 @@ Apply the SQL files in lexical order:
 007_sync_events.sql
 008_snapshots.sql
 009_rls.sql
+010_native_state.sql
+011_native_state_fk_fix.sql
 ```
 
 The numbered files are repository source migrations. When a Supabase project
