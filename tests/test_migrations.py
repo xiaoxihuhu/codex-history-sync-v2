@@ -260,6 +260,12 @@ class MigrationContractTests(unittest.TestCase):
         self.assertIn("primary key", native)
         self.assertIn("native_metadata jsonb", native)
         self.assertIn("metadata_hash text not null", native)
+        self.assertIn(
+            "foreign key (user_id, source_device_id)\n"
+            "    references public.devices (user_id, id)\n"
+            "    on delete set null (source_device_id)",
+            native,
+        )
         self.assertIn("unique (export_id, source_project_id)", native)
         self.assertIn("unique (native_project_id, position)", native)
         self.assertIn("on delete cascade", native)
@@ -268,6 +274,7 @@ class MigrationContractTests(unittest.TestCase):
             native,
         )
         self.assertIn("snapshots_native_export_fk", native)
+        self.assertIn("on delete set null (native_export_id)", native)
         self.assertNotRegex(native, r"\bdrop\s+(table|schema)\b")
         self.assertNotIn("state_5.sqlite", native)
 

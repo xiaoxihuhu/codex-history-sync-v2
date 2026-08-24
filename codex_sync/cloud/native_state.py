@@ -953,6 +953,36 @@ class SupabaseNativeStateRepository:
 
     def complete_export(self, user_id: str, export_id: str) -> NativeStateExportRow:
         current = self._owned(user_id, export_id)
+        projects = self.list_projects(user_id, export_id)
+        project_roots = self.list_project_roots(user_id, export_id)
+        threads = self.list_threads(user_id, export_id)
+        related_state = self.list_related_state(user_id, export_id)
+        counts = {
+            "projects": len(projects),
+            "project_roots": len(project_roots),
+            "threads": len(threads),
+            "related_state": len(related_state),
+        }
+        expected = {
+            "projects": current.project_count,
+            "project_roots": current.project_root_count,
+            "threads": current.thread_count,
+            "related_state": current.related_state_count,
+        }
+        if counts != expected:
+            raise NativeStateRepositoryError(
+                f"Native export is incomplete: expected {expected}, found {counts}"
+            )
+        for row in threads:
+            if native_metadata_hash(row.native_metadata) != row.metadata_hash:
+                raise NativeStateRepositoryError(
+                    f"Thread metadata hash mismatch: {row.codex_thread_id}"
+                )
+        for row in related_state:
+            if native_metadata_hash(row.native_metadata) != row.metadata_hash:
+                raise NativeStateRepositoryError(
+                    f"Related metadata hash mismatch: {row.object_key}"
+                )
         rows = _rows(
             self._request(
                 "PATCH",

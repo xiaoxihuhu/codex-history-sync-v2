@@ -4,7 +4,7 @@
 create table public.native_state_exports (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
-  source_device_id uuid references public.devices(id) on delete set null,
+  source_device_id uuid,
   format_version integer not null check (format_version > 0),
   codex_schema_fingerprint text not null check (length(codex_schema_fingerprint) = 64),
   codex_schema_json jsonb not null,
@@ -20,7 +20,10 @@ create table public.native_state_exports (
   completed_at timestamptz,
   is_complete boolean not null default false,
   metadata jsonb not null default '{}'::jsonb,
-  unique (user_id, id)
+  unique (user_id, id),
+  foreign key (user_id, source_device_id)
+    references public.devices (user_id, id)
+    on delete set null (source_device_id)
 );
 
 create table public.native_projects (
@@ -63,7 +66,7 @@ create table public.native_threads (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references auth.users(id) on delete cascade,
   export_id uuid not null,
-  source_device_id uuid references public.devices(id) on delete set null,
+  source_device_id uuid,
   codex_thread_id text not null,
   source_project_id text,
   native_project_id uuid references public.native_projects(id) on delete set null,
@@ -86,6 +89,9 @@ create table public.native_threads (
   updated_at timestamptz not null default timezone('utc', now()),
   unique (user_id, id),
   unique (export_id, codex_thread_id),
+  foreign key (user_id, source_device_id)
+    references public.devices (user_id, id)
+    on delete set null (source_device_id),
   foreign key (user_id, export_id)
     references public.native_state_exports (user_id, id) on delete cascade
 );
@@ -143,7 +149,7 @@ alter table public.snapshots
   add constraint snapshots_native_export_fk
   foreign key (user_id, native_export_id)
   references public.native_state_exports (user_id, id)
-  on delete set null;
+  on delete set null (native_export_id);
 
 create index snapshots_native_export_idx
   on public.snapshots (user_id, native_export_id);

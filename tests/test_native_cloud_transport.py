@@ -22,6 +22,7 @@ from codex_sync.cloud.native_state import (
     NativeCloudRetryPolicy,
     NativeCloudSchemaNotInstalled,
     NativeCloudSchemaVerifier,
+    NativeStateRepositoryError,
     SupabaseNativeStateRepository,
 )
 from codex_sync.cloud.supabase_client import HttpResponse, SupabaseClient
@@ -356,6 +357,27 @@ class NativeCloudTransportTests(unittest.TestCase):
         with self.assertRaises(Exception):
             _repository(forbidden).create_export(bundle.export)
         self.assertEqual(len(forbidden.requests), 1)
+
+    def test_supabase_repository_rejects_incomplete_export_before_completion(self) -> None:
+        transport = MockRestTransport()
+        repository = _repository(transport)
+        bundle = _bundle_with_manifest("export-incomplete")
+        repository.create_export(bundle.export)
+
+        with self.assertRaises(NativeStateRepositoryError):
+            repository.complete_export(USER_A, bundle.export.id)
+
+        export = repository.get_export(USER_A, bundle.export.id)
+        self.assertIsNotNone(export)
+        self.assertFalse(export.is_complete)
+        self.assertFalse(
+            any(
+                request["method"] == "PATCH"
+                and request["payload"]
+                and request["payload"].get("is_complete") is True
+                for request in transport.requests
+            )
+        )
 
     def test_backup_restore_and_cloud_to_current_merge_use_isolated_fixture(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
