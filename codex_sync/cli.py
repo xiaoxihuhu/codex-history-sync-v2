@@ -105,12 +105,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_export_parser.add_argument("--output", required=True)
     native_export_parser.add_argument("--session-index")
+    native_export_parser.add_argument(
+        "--thread-id",
+        action="append",
+        dest="thread_ids",
+        help="Limit the export to one or more explicitly selected Thread IDs",
+    )
     native_local_parser = subparsers.add_parser(
         "native-export-local",
         help="Export versioned Codex-native metadata to a local JSON file",
     )
     native_local_parser.add_argument("--output", required=True)
     native_local_parser.add_argument("--session-index")
+    native_local_parser.add_argument(
+        "--thread-id",
+        action="append",
+        dest="thread_ids",
+        help="Limit the export to one or more explicitly selected Thread IDs",
+    )
     native_plan_parser = subparsers.add_parser(
         "native-cloud-schema-plan",
         help="Build a local-only Native Cloud row plan without network writes",
@@ -266,6 +278,7 @@ def main() -> int:
                     if args.session_index
                     else paths.session_index_path
                 ),
+                thread_ids=args.thread_ids,
             )
             output = Path(args.output).expanduser()
             export.write_json(output)
@@ -276,6 +289,9 @@ def main() -> int:
                 "projects": len(export.projects),
                 "project_roots": len(export.project_roots),
                 "related_tables": sorted(export.related_state),
+                "scoped_thread_ids": sorted(
+                    item.thread_id for item in export.threads
+                ),
                 "format_version": export.format_version,
             }
         elif args.command == "native-export-local":
@@ -286,6 +302,7 @@ def main() -> int:
                     if args.session_index
                     else paths.session_index_path
                 ),
+                thread_ids=args.thread_ids,
             )
             output = Path(args.output).expanduser()
             export.write_json(output)
@@ -296,6 +313,9 @@ def main() -> int:
                 "projects": len(export.projects),
                 "project_roots": len(export.project_roots),
                 "related_tables": sorted(export.related_state),
+                "scoped_thread_ids": sorted(
+                    item.thread_id for item in export.threads
+                ),
                 "format_version": export.format_version,
             }
         elif args.command == "native-cloud-schema-plan":

@@ -673,6 +673,148 @@ class NativeArchitectureTests(unittest.TestCase):
                 THREAD_ID_A1,
             )
 
+    def test_scoped_native_export_includes_only_selected_thread_relations(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            database = root / "state_5.sqlite"
+            _create_schema(database, "current", with_projects=True)
+            source_a = root / "project-a"
+            source_b = root / "project-b"
+            source_a.mkdir()
+            source_b.mkdir()
+            session_a = root / "sessions" / f"{THREAD_ID_A1}.jsonl"
+            session_b = root / "sessions" / f"{THREAD_ID_A2}.jsonl"
+            _make_session(session_a, THREAD_ID_A1, source_a, "A1")
+            _make_session(session_b, THREAD_ID_A2, source_b, "A2")
+            with closing(sqlite3.connect(database)) as connection:
+                connection.executemany(
+                    "INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        (PROJECT_A, "Project A", "{}", 0, 1, 2),
+                        (PROJECT_B, "Project B", "{}", 1, 1, 2),
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO project_roots VALUES (?, ?, ?)",
+                    (
+                        (PROJECT_A, 0, str(source_a)),
+                        (PROJECT_B, 0, str(source_b)),
+                    ),
+                )
+                connection.executemany(
+                    """
+                    INSERT INTO threads (
+                        id, rollout_path, created_at, updated_at, source,
+                        model_provider, cwd, title, sandbox_policy, approval_mode,
+                        preview, recency_at_ms, history_mode, name,
+                        first_user_message, project_id, thread_section_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            THREAD_ID_A1,
+                            str(session_a),
+                            1,
+                            2,
+                            "vscode",
+                            "openai",
+                            str(source_a),
+                            "A1",
+                            "{}",
+                            "never",
+                            "A1 preview",
+                            2000,
+                            "legacy",
+                            "A1",
+                            "A1",
+                            PROJECT_A,
+                            "source-section",
+                        ),
+                        (
+                            THREAD_ID_A2,
+                            str(session_b),
+                            1,
+                            2,
+                            "vscode",
+                            "openai",
+                            str(source_b),
+                            "A2",
+                            "{}",
+                            "never",
+                            "A2 preview",
+                            2000,
+                            "legacy",
+                            "A2",
+                            "A2",
+                            PROJECT_B,
+                            "other-section",
+                        ),
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO thread_sections VALUES (?, ?, ?)",
+                    (
+                        ("source-section", "Selected", None),
+                        ("other-section", "Other", None),
+                    ),
+                )
+                connection.executemany(
+                    "INSERT INTO thread_dynamic_tools VALUES (?, ?, ?, ?, ?)",
+                    (
+                        (THREAD_ID_A1, 0, "tool", "description", "{}"),
+                        (THREAD_ID_A2, 0, "other", "description", "{}"),
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO thread_spawn_edges VALUES (?, ?, ?)",
+                    (THREAD_ID_A1, THREAD_ID_A2, "completed"),
+                )
+                connection.commit()
+
+            exported = export_native_state(
+                database,
+                thread_ids=[THREAD_ID_A1],
+            )
+            self.assertEqual(
+                [item.thread_id for item in exported.threads],
+                [THREAD_ID_A1],
+            )
+            self.assertEqual(
+                [str(item["id"]) for item in exported.projects],
+                [PROJECT_A],
+            )
+            self.assertEqual(
+                [str(item["project_id"]) for item in exported.project_roots],
+                [PROJECT_A],
+            )
+            self.assertEqual(
+                [str(item["id"]) for item in exported.related_state["thread_sections"]],
+                ["source-section"],
+            )
+            self.assertEqual(
+                [
+                    str(item["thread_id"])
+                    for item in exported.related_state["thread_dynamic_tools"]
+                ],
+                [THREAD_ID_A1],
+            )
+            self.assertNotIn("thread_spawn_edges", exported.related_state)
+            self.assertEqual(exported.session_index, {})
+            self.assertEqual(
+                exported.source["scope"]["thread_ids"],
+                [THREAD_ID_A1],
+            )
+
+    def test_scoped_native_export_rejects_missing_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "state_5.sqlite"
+            _create_schema(database, "current")
+            with self.assertRaisesRegex(RuntimeError, "not found"):
+                export_native_state(
+                    database,
+                    thread_ids=[THREAD_ID_A1],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

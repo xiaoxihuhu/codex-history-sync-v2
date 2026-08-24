@@ -421,6 +421,49 @@ class NativeCloudTransportTests(unittest.TestCase):
                     3,
                 )
 
+    def test_scoped_backup_uploads_only_requested_thread_and_marks_canary(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "state_5.sqlite"
+            _create_source_database(source, 3)
+            repository = FakeSupabaseNativeStateRepository()
+            result = NativeCloudBackupService(
+                repository,
+                user_id=USER_A,
+                source_database=source,
+                thread_ids=["thread-00001"],
+            ).backup(
+                snapshot_destination=root / "snapshot.sqlite",
+                metadata={
+                    "purpose": "phase11c_real_single_thread_canary",
+                    "canary_thread_id_hash": "fixture-hash",
+                },
+            )
+
+            self.assertTrue(result.export.is_complete)
+            self.assertEqual(result.manifest.thread_count, 1)
+            self.assertEqual(
+                [row.codex_thread_id for row in repository.list_threads(
+                    USER_A,
+                    result.export_id,
+                )],
+                ["thread-00001"],
+            )
+            metadata = dict(result.export.metadata or {})
+            self.assertEqual(
+                metadata["purpose"],
+                "phase11c_real_single_thread_canary",
+            )
+            self.assertEqual(metadata["canary_thread_id_hash"], "fixture-hash")
+            restored = NativeCloudRestoreService(
+                repository,
+                user_id=USER_A,
+            ).restore(export_id=result.export_id)
+            self.assertEqual(
+                [item.thread_id for item in restored.native_export.threads],
+                ["thread-00001"],
+            )
+
     def test_resume_after_1000_thread_upload_interrupted_at_600(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

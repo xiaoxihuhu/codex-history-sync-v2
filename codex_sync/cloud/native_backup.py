@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from codex_sync.cloud.native_manifest import NativeExportManifest
 from codex_sync.cloud.native_state import (
@@ -84,6 +84,7 @@ class NativeCloudBackupService:
         source_device_id: str | None = None,
         source_codex_version: str | None = None,
         source_platform: str | None = None,
+        thread_ids: Iterable[str] | None = None,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
@@ -95,6 +96,11 @@ class NativeCloudBackupService:
         self.source_device_id = source_device_id
         self.source_codex_version = source_codex_version
         self.source_platform = source_platform
+        self.thread_ids = (
+            tuple(str(thread_id).strip() for thread_id in thread_ids)
+            if thread_ids is not None
+            else None
+        )
 
     def backup(
         self,
@@ -102,6 +108,7 @@ class NativeCloudBackupService:
         resume_export_id: str | None = None,
         snapshot_destination: Path | None = None,
         label: str = "native",
+        metadata: Mapping[str, object] | None = None,
     ) -> NativeCloudBackupResult:
         verify_schema = getattr(self.repository, "verify_schema", None)
         if callable(verify_schema):
@@ -114,6 +121,7 @@ class NativeCloudBackupService:
         local_export = export_native_state(
             snapshot.path,
             session_index_path=self.session_index_path,
+            thread_ids=self.thread_ids,
         )
         bundle = NativeStateCodec.encode_export(
             local_export,
@@ -132,6 +140,7 @@ class NativeCloudBackupService:
         )
         metadata = {
             **dict(bundle.export.metadata or {}),
+            **dict(metadata or {}),
             "status": "created",
             "manifest": manifest.to_dict(),
         }

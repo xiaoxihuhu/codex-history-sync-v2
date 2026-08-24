@@ -6,7 +6,7 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from codex_sync.local.catalog import read_session_id
 
@@ -264,6 +264,8 @@ def _export_table_rows(
     table: str,
     *,
     thread_ids: set[str] | None = None,
+    project_ids: set[str] | None = None,
+    section_ids: set[str] | None = None,
 ) -> tuple[dict[str, object], ...]:
     report = CodexSchemaInspector.inspect(connection)
     table_schema = report.tables.get(table)
@@ -280,20 +282,43 @@ def _export_table_rows(
         f'FROM "{quoted}"'
     ).fetchall()
     output = []
+    scoped = thread_ids is not None
+    thread_relation_columns = {
+        "thread_id",
+        "parent_thread_id",
+        "child_thread_id",
+    }
     for row in rows:
         item = {
             name: _json_value(row[name])
             for name in columns
         }
-        if thread_ids is not None:
-            candidate = str(
-                item.get("thread_id")
-                or item.get("parent_thread_id")
-                or item.get("child_thread_id")
-                or ""
-            )
-            if candidate and candidate not in thread_ids:
-                continue
+        if scoped:
+            if table == "projects":
+                if str(item.get("id") or "") not in (project_ids or set()):
+                    continue
+            elif table == "project_roots":
+                if str(item.get("project_id") or "") not in (project_ids or set()):
+                    continue
+            elif table == "thread_sections":
+                if str(item.get("id") or "") not in (section_ids or set()):
+                    continue
+            else:
+                thread_values = {
+                    str(item[name])
+                    for name in thread_relation_columns
+                    if name in item and item[name] not in (None, "")
+                }
+                project_value = str(item.get("project_id") or "")
+                section_value = str(item.get("thread_section_id") or "")
+                if not thread_values and not project_value and not section_value:
+                    continue
+                if thread_values and not thread_values.issubset(thread_ids or set()):
+                    continue
+                if project_value and project_value not in (project_ids or set()):
+                    continue
+                if section_value and section_value not in (section_ids or set()):
+                    continue
         output.append(item)
     return tuple(output)
 
@@ -302,6 +327,7 @@ def export_native_state(
     source_database: Path,
     *,
     session_index_path: Path | None = None,
+    thread_ids: Iterable[str] | None = None,
 ) -> NativeStateExport:
     database = source_database.expanduser().resolve(strict=True)
     connection = sqlite3.connect(
@@ -324,16 +350,67 @@ def export_native_state(
             for name in schema.tables["threads"].columns
             if name in thread_columns and _safe_column(name)
         ]
-        rows = connection.execute(
-            f'SELECT {", ".join(quoted_thread)} FROM "threads" ORDER BY id'
-        ).fetchall()
+        requested_thread_ids = (
+            {
+                str(thread_id).strip()
+                for thread_id in thread_ids
+                if str(thread_id).strip()
+            }
+            if thread_ids is not None
+            else None
+        )
+        if thread_ids is not None and not requested_thread_ids:
+            raise ValueError("Native export thread_ids cannot be empty")
+        if requested_thread_ids is None:
+            rows = connection.execute(
+                f'SELECT {", ".join(quoted_thread)} FROM "threads" ORDER BY id'
+            ).fetchall()
+        else:
+            placeholders = ", ".join("?" for _ in requested_thread_ids)
+            rows = connection.execute(
+                f'SELECT {", ".join(quoted_thread)} FROM "threads" '
+                f"WHERE id IN ({placeholders}) ORDER BY id",
+                sorted(requested_thread_ids),
+            ).fetchall()
         threads = tuple(
             NativeThreadRecord.from_row(row, allowed_columns=thread_columns)
             for row in rows
         )
-        thread_ids = {item.thread_id for item in threads}
-        projects = _export_table_rows(connection, "projects")
-        project_roots = _export_table_rows(connection, "project_roots")
+        selected_thread_ids = {item.thread_id for item in threads}
+        if requested_thread_ids is not None:
+            missing_thread_ids = requested_thread_ids - selected_thread_ids
+            if missing_thread_ids:
+                raise RuntimeError(
+                    "Requested Native Threads were not found: "
+                    + ", ".join(sorted(missing_thread_ids))
+                )
+        selected_project_ids = {
+            str(item.metadata["project_id"])
+            for item in threads
+            if item.metadata.get("project_id") not in (None, "")
+        }
+        selected_section_ids = {
+            str(item.metadata["thread_section_id"])
+            for item in threads
+            if item.metadata.get("thread_section_id") not in (None, "")
+        }
+        scope_thread_ids = (
+            selected_thread_ids if requested_thread_ids is not None else None
+        )
+        projects = _export_table_rows(
+            connection,
+            "projects",
+            thread_ids=scope_thread_ids,
+            project_ids=selected_project_ids,
+            section_ids=selected_section_ids,
+        )
+        project_roots = _export_table_rows(
+            connection,
+            "project_roots",
+            thread_ids=scope_thread_ids,
+            project_ids=selected_project_ids,
+            section_ids=selected_section_ids,
+        )
         related: dict[str, tuple[dict[str, object], ...]] = {}
         for table in schema.related_tables:
             if table in {"threads", "projects", "project_roots"}:
@@ -341,7 +418,9 @@ def export_native_state(
             rows_for_table = _export_table_rows(
                 connection,
                 table,
-                thread_ids=thread_ids,
+                thread_ids=scope_thread_ids,
+                project_ids=selected_project_ids,
+                section_ids=selected_section_ids,
             )
             if rows_for_table:
                 related[table] = rows_for_table
@@ -354,7 +433,14 @@ def export_native_state(
             if not line.strip():
                 continue
             item = json.loads(line)
-            if isinstance(item, dict) and item.get("id"):
+            if (
+                isinstance(item, dict)
+                and item.get("id")
+                and (
+                    requested_thread_ids is None
+                    or str(item["id"]) in selected_thread_ids
+                )
+            ):
                 session_index[str(item["id"])] = dict(item)
 
     session_refs: list[dict[str, object]] = []
@@ -374,12 +460,21 @@ def export_native_state(
             }
         )
 
+    source_payload = {
+        "database": str(database),
+        "schema": schema.to_dict(),
+    }
+    if requested_thread_ids is not None:
+        source_payload["scope"] = {
+            "type": "thread_ids",
+            "thread_ids": sorted(selected_thread_ids),
+            "project_ids": sorted(selected_project_ids),
+            "section_ids": sorted(selected_section_ids),
+        }
+
     return NativeStateExport(
         format_version=NATIVE_FORMAT_VERSION,
-        source={
-            "database": str(database),
-            "schema": schema.to_dict(),
-        },
+        source=source_payload,
         projects=projects,
         project_roots=project_roots,
         threads=threads,
