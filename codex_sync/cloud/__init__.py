@@ -7,6 +7,12 @@ from .devices import DeviceService, SupabaseDeviceRepository
 from .restore import SupabaseRestoreRepository
 from .supabase_client import SupabaseClient, SupabaseError
 from .snapshots import SupabaseSnapshotRepository
+from .native_state import (
+    EncryptedNativeSnapshotRepository,
+    FakeSupabaseNativeStateRepository,
+    InMemoryNativeStateRepository,
+    NativeStateRepository,
+)
 from .workspaces import SupabaseWorkspaceRepository
 
 __all__ = [
@@ -20,4 +26,8 @@ __all__ = [
     "SupabaseDeviceRepository",
     "SupabaseError",
     "SupabaseSnapshotRepository",
+    "EncryptedNativeSnapshotRepository",
+    "FakeSupabaseNativeStateRepository",
+    "InMemoryNativeStateRepository",
+    "NativeStateRepository",
 ]

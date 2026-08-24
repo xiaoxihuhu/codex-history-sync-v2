@@ -38,6 +38,8 @@ from codex_sync.local.repair_engine import (
 from codex_sync.local.thread_diagnose import diagnose_thread
 from codex_sync.native import (
     CodexSchemaInspector,
+    NativeStateCodec,
+    NativeStateExport,
     NativeVisibilityVerifier,
     create_native_snapshot,
     export_native_state,
@@ -103,6 +105,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     native_export_parser.add_argument("--output", required=True)
     native_export_parser.add_argument("--session-index")
+    native_local_parser = subparsers.add_parser(
+        "native-export-local",
+        help="Export versioned Codex-native metadata to a local JSON file",
+    )
+    native_local_parser.add_argument("--output", required=True)
+    native_local_parser.add_argument("--session-index")
+    native_plan_parser = subparsers.add_parser(
+        "native-cloud-schema-plan",
+        help="Build a local-only Native Cloud row plan without network writes",
+    )
+    native_plan_parser.add_argument("--input", required=True)
+    native_plan_parser.add_argument("--user-id", required=True)
     native_visibility_parser = subparsers.add_parser(
         "native-visibility",
         help="Verify Codex-native Thread visibility prerequisites without writing",
@@ -263,6 +277,47 @@ def main() -> int:
                 "project_roots": len(export.project_roots),
                 "related_tables": sorted(export.related_state),
                 "format_version": export.format_version,
+            }
+        elif args.command == "native-export-local":
+            export = export_native_state(
+                paths.db_path,
+                session_index_path=(
+                    Path(args.session_index)
+                    if args.session_index
+                    else paths.session_index_path
+                ),
+            )
+            output = Path(args.output).expanduser()
+            export.write_json(output)
+            payload = {
+                "action": "native-export-local",
+                "output": str(output),
+                "threads": len(export.threads),
+                "projects": len(export.projects),
+                "project_roots": len(export.project_roots),
+                "related_tables": sorted(export.related_state),
+                "format_version": export.format_version,
+            }
+        elif args.command == "native-cloud-schema-plan":
+            local_export = NativeStateExport.read_json(
+                Path(args.input).expanduser()
+            )
+            bundle = NativeStateCodec.encode_export(
+                local_export,
+                user_id=args.user_id,
+            )
+            payload = {
+                "action": "native-cloud-schema-plan",
+                "network_write": False,
+                "export_id": bundle.export.id,
+                "format_version": bundle.export.format_version,
+                "codex_schema_fingerprint": bundle.export.codex_schema_fingerprint,
+                "counts": {
+                    "threads": len(bundle.threads),
+                    "projects": len(bundle.projects),
+                    "project_roots": len(bundle.project_roots),
+                    "related_state": len(bundle.related_state),
+                },
             }
         elif args.command == "native-visibility":
             report = NativeVisibilityVerifier().verify(

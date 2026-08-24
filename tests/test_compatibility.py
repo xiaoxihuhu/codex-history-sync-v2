@@ -28,6 +28,8 @@ class CompatibilityTests(unittest.TestCase):
             "native-schema",
             "native-snapshot",
             "native-export",
+            "native-export-local",
+            "native-cloud-schema-plan",
             "native-visibility",
             "cloud-configure",
             "auth-sign-up",
@@ -55,6 +57,15 @@ class CompatibilityTests(unittest.TestCase):
                 command_args += ["--output", "native.sqlite"]
             elif command == "native-export":
                 command_args += ["--output", "native.json"]
+            elif command == "native-export-local":
+                command_args += ["--output", "native-local.json"]
+            elif command == "native-cloud-schema-plan":
+                command_args += [
+                    "--input",
+                    "native.json",
+                    "--user-id",
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                ]
             elif command in {"auth-sign-up", "auth-sign-in"}:
                 command_args += ["--email", "user@example.com"]
             elif command == "cloud-snapshot-restore":

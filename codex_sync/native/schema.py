@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -116,6 +117,158 @@ class NativeSchemaReport:
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+
+
+@dataclass(frozen=True)
+class NativeSchemaFingerprint:
+    """Stable digest of the SQLite contract, excluding local identity."""
+
+    digest: str
+    canonical: dict[str, object]
+
+    @classmethod
+    def from_report(cls, report: NativeSchemaReport) -> "NativeSchemaFingerprint":
+        tables: list[dict[str, object]] = []
+        for table_name in sorted(report.tables):
+            table = report.tables[table_name]
+            tables.append(
+                {
+                    "name": table.name,
+                    "columns": [
+                        {
+                            "name": column.name,
+                            "type": column.type,
+                            "not_null": column.not_null,
+                            "default_value": column.default_value,
+                            "primary_key": column.primary_key,
+                        }
+                        for column in sorted(
+                            table.columns.values(),
+                            key=lambda item: item.name,
+                        )
+                    ],
+                    "foreign_keys": [
+                        {
+                            "table": item.table,
+                            "from_column": item.from_column,
+                            "to_column": item.to_column,
+                            "on_update": item.on_update,
+                            "on_delete": item.on_delete,
+                        }
+                        for item in sorted(
+                            table.foreign_keys,
+                            key=lambda item: (
+                                item.table,
+                                item.from_column,
+                                item.to_column,
+                                item.on_update,
+                                item.on_delete,
+                            ),
+                        )
+                    ],
+                    "indexes": [
+                        {
+                            "name": item.name,
+                            "unique": item.unique,
+                            "origin": item.origin,
+                            "partial": item.partial,
+                            "sql": item.sql,
+                        }
+                        for item in sorted(
+                            table.indexes,
+                            key=lambda item: item.name,
+                        )
+                    ],
+                }
+            )
+        canonical = {
+            "tables": tables,
+        }
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return cls(
+            digest=hashlib.sha256(encoded).hexdigest(),
+            canonical=canonical,
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, object]) -> "NativeSchemaFingerprint":
+        """Build the same fingerprint from a serialized schema report."""
+
+        tables: list[dict[str, object]] = []
+        raw_tables = payload.get("tables") or {}
+        if not isinstance(raw_tables, dict):
+            raise ValueError("Serialized Native schema tables must be an object")
+        for table_name in sorted(str(name) for name in raw_tables):
+            raw_table = raw_tables[table_name]
+            if not isinstance(raw_table, dict):
+                raise ValueError(f"Serialized Native table is invalid: {table_name}")
+            columns = raw_table.get("columns") or {}
+            if not isinstance(columns, dict):
+                raise ValueError(f"Serialized Native columns are invalid: {table_name}")
+            tables.append(
+                {
+                    "name": str(raw_table.get("name") or table_name),
+                    "columns": [
+                        {
+                            "name": str(item.get("name") or name),
+                            "type": str(item.get("type") or ""),
+                            "not_null": bool(item.get("not_null")),
+                            "default_value": item.get("default_value"),
+                            "primary_key": int(item.get("primary_key") or 0),
+                        }
+                        for name, item in sorted(columns.items())
+                        if isinstance(item, dict)
+                    ],
+                    "foreign_keys": [
+                        {
+                            "table": str(item.get("table") or ""),
+                            "from_column": str(item.get("from_column") or ""),
+                            "to_column": str(item.get("to_column") or ""),
+                            "on_update": str(item.get("on_update") or ""),
+                            "on_delete": str(item.get("on_delete") or ""),
+                        }
+                        for item in raw_table.get("foreign_keys") or []
+                        if isinstance(item, dict)
+                    ],
+                    "indexes": [
+                        {
+                            "name": str(item.get("name") or ""),
+                            "unique": bool(item.get("unique")),
+                            "origin": str(item.get("origin") or ""),
+                            "partial": bool(item.get("partial")),
+                            "sql": item.get("sql"),
+                        }
+                        for item in raw_table.get("indexes") or []
+                        if isinstance(item, dict)
+                    ],
+                }
+            )
+        canonical = {
+            "tables": tables,
+        }
+        encoded = json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return cls(
+            digest=hashlib.sha256(encoded).hexdigest(),
+            canonical=canonical,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "digest": self.digest,
+            "canonical": self.canonical,
+        }
 
 
 class CodexSchemaInspector:

@@ -4,6 +4,8 @@ import re
 import unittest
 from pathlib import Path
 
+from codex_sync.native.policy import NativeCloudPolicy
+
 MIGRATION_DIR = Path(__file__).parents[1] / "migrations"
 EXPECTED_MIGRATIONS = [
     "001_profiles.sql",
@@ -15,6 +17,7 @@ EXPECTED_MIGRATIONS = [
     "007_sync_events.sql",
     "008_snapshots.sql",
     "009_rls.sql",
+    "010_native_state.sql",
 ]
 PUBLIC_TABLES = [
     "profiles",
@@ -232,6 +235,68 @@ class MigrationContractTests(unittest.TestCase):
         self.assertIn(
             "revoke all on function codex_sync_private.handle_new_auth_user() from public, anon, authenticated;",
             sql,
+        )
+
+    def test_native_state_migration_is_additive_and_contract_complete(self) -> None:
+        native = read_migration("010_native_state.sql").lower()
+        for table in (
+            "native_state_exports",
+            "native_projects",
+            "native_project_roots",
+            "native_threads",
+            "native_related_state",
+        ):
+            self.assertRegex(native, rf"create table public\.{table}\s*\(")
+            self.assertIn(
+                f"alter table public.{table} enable row level security;",
+                native,
+            )
+            self.assertRegex(
+                native,
+                rf"create policy \w+\s+on public\.{table}\s+"
+                r"for all\s+to authenticated",
+            )
+
+        self.assertIn("primary key", native)
+        self.assertIn("native_metadata jsonb", native)
+        self.assertIn("metadata_hash text not null", native)
+        self.assertIn("unique (export_id, source_project_id)", native)
+        self.assertIn("unique (native_project_id, position)", native)
+        self.assertIn("on delete cascade", native)
+        self.assertIn(
+            "alter table public.snapshots\n  add column native_export_id uuid;",
+            native,
+        )
+        self.assertIn("snapshots_native_export_fk", native)
+        self.assertNotRegex(native, r"\bdrop\s+(table|schema)\b")
+        self.assertNotIn("state_5.sqlite", native)
+
+    def test_native_state_allowlist_and_policy_contract_are_explicit(self) -> None:
+        native = read_migration("010_native_state.sql").lower()
+        for table in (
+            "thread_sections",
+            "thread_dynamic_tools",
+            "thread_spawn_edges",
+        ):
+            self.assertIn(f"'{table}'", native)
+        for field in (
+            "token",
+            "secret",
+            "password",
+            "credential",
+            "cookie",
+            "api_key",
+            "service_role",
+            "auth",
+            "authorization",
+        ):
+            self.assertTrue(NativeCloudPolicy.is_denied_field(field))
+        self.assertFalse(NativeCloudPolicy.is_denied_field("model_provider"))
+
+    def test_existing_migrations_are_not_rewritten(self) -> None:
+        self.assertEqual(
+            sorted(path.name for path in MIGRATION_DIR.glob("*.sql"))[:9],
+            EXPECTED_MIGRATIONS[:9],
         )
 
 
